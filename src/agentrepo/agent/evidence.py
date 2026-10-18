@@ -1783,7 +1783,7 @@ def describe_criteria(criteria: list[dict], plan: Optional[dict]) -> str:
                     ]
                     flag = (f" -- matched in {', '.join(locs)}; read unread relevant lines with get_file" if locs else "")
                 else:
-                    flag = ""
+                    flag = "" 
             elif s.get("tool") == "get_file" and prov.get("truncated") and next_start:
                 flag = f" -- partial read only; continue with get_file start_line={next_start}"
             elif s.get("tool") == "find_files" and s.get("result") == RESULT_EMPTY:

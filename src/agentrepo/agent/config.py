@@ -1,9 +1,11 @@
 """
 Agent configuration, read from environment variables (and a local .env file).
 
-    GROQ_API_KEY       required to run the real agent
-    GROQ_MODEL         default: openai/gpt-oss-120b (a Groq model with tool calling)
-    GROQ_TEMPERATURE   default: 0
+    GEMINI_API_KEY     required to run the real agent
+    GEMINI_MODEL       default: gemini-3.5-flash-lite
+    GEMINI_TEMPERATURE default: 0
+
+    Legacy GROQ_* variables are accepted as fallbacks for existing .env files.
     MAX_AGENT_STEPS       default: 8  (max tool-using LLM turns before a forced final answer)
     MAX_PLAN_STEPS        default: 8  (max steps the upfront planning call may
                                        propose, and max PENDING steps a revise_plan call may set)
@@ -36,7 +38,7 @@ from typing import Mapping
 
 from dotenv import load_dotenv
 
-DEFAULT_MODEL = "openai/gpt-oss-120b"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_MAX_STEPS = 8
 DEFAULT_MAX_PLAN_STEPS = 8
@@ -62,7 +64,7 @@ MAX_OBSERVATION_CHARS = 100_000
 
 
 class MissingApiKeyError(RuntimeError):
-    """GROQ_API_KEY is not configured."""
+    """GEMINI_API_KEY is not configured."""
 
 
 class ConfigError(ValueError):
@@ -103,15 +105,22 @@ def load_config(require_api_key: bool = True, env: Mapping[str, str] | None = No
         load_dotenv()  # does not override variables already set in the environment
         env = os.environ
 
-    api_key = (env.get("GROQ_API_KEY") or "").strip() or None
+    # Prefer Gemini variables. GROQ_* aliases remain supported so older
+    # deployments can migrate their .env file without changing other settings.
+    api_key = (env.get("GEMINI_API_KEY") or env.get("GROQ_API_KEY") or "").strip() or None
     if require_api_key and api_key is None:
         raise MissingApiKeyError(
-            "GROQ_API_KEY is not set. Copy .env.example to .env, put your Groq API key in it "
-            "(https://console.groq.com/keys), or export GROQ_API_KEY in your shell."
+            "GEMINI_API_KEY is not set. Copy .env.example to .env, add your Gemini API key "
+            "(https://aistudio.google.com/apikey), or export GEMINI_API_KEY in your shell. "
+            "Legacy GROQ_API_KEY is also accepted temporarily."
         )
 
-    model = (env.get("GROQ_MODEL") or "").strip() or DEFAULT_MODEL
-    temperature = _parse(env, "GROQ_TEMPERATURE", float, DEFAULT_TEMPERATURE)
+    model = (env.get("GEMINI_MODEL") or env.get("GROQ_MODEL") or "").strip() or DEFAULT_MODEL
+    temperature_raw = (env.get("GEMINI_TEMPERATURE") or env.get("GROQ_TEMPERATURE") or "").strip()
+    try:
+        temperature = float(temperature_raw) if temperature_raw else DEFAULT_TEMPERATURE
+    except ValueError:
+        raise ConfigError(f"GEMINI_TEMPERATURE must be a float, got {temperature_raw!r}") from None
     max_steps = _parse(env, "MAX_AGENT_STEPS", int, DEFAULT_MAX_STEPS)
     max_plan_steps = _parse(env, "MAX_PLAN_STEPS", int, DEFAULT_MAX_PLAN_STEPS)
     max_observation_chars = _parse(env, "MAX_OBSERVATION_CHARS", int, DEFAULT_MAX_OBSERVATION_CHARS)
@@ -121,7 +130,7 @@ def load_config(require_api_key: bool = True, env: Mapping[str, str] | None = No
     enable_checkpoints = _parse_bool(env, "ENABLE_CHECKPOINTS", DEFAULT_ENABLE_CHECKPOINTS)
     rollback_on_repair_limit = _parse_bool(env, "ROLLBACK_ON_REPAIR_LIMIT", DEFAULT_ROLLBACK_ON_REPAIR_LIMIT)
     if not 0.0 <= temperature <= 2.0:
-        raise ConfigError(f"GROQ_TEMPERATURE must be between 0 and 2, got {temperature}")
+        raise ConfigError(f"GEMINI_TEMPERATURE must be between 0 and 2, got {temperature}")
     load_context_token_budget(env)  # fail fast on an invalid value; used at request time
     return AgentConfig(api_key=api_key, model=model, temperature=temperature,
                        max_agent_steps=max_steps, max_plan_steps=max_plan_steps,

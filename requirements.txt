@@ -43,3 +43,6 @@ xxhash==4.0.1
 zstandard==0.25.0
 rank-bm25>=0.2.2
 rich>=14.2.0
+
+# Gemini chat model integration (supports LangChain tool calling)
+langchain-google-genai>=2.1.12

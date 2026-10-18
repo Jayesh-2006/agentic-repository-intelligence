@@ -2513,7 +2513,7 @@ def _reply_text(reply) -> str:
                 val = ak.get(key)
                 if isinstance(val, str) and val.strip():
                     return val.strip()
-    return ""
+    return "" 
 
 
 def _pending_tool_results(messages: list) -> list[tuple[str, str, str, dict]]:

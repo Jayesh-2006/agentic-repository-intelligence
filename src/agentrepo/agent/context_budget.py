@@ -1,4 +1,36 @@
+"""
+Token-budgeted, model-facing context management.
 
+`bounded_model_history()` (utils.py) limits the NUMBER of retained turns, but a
+single tool observation can hold a large source excerpt, so a request can still
+exceed a provider's request-size / tokens-per-minute limit. This module bounds
+the SIZE of the request that is actually sent, without touching run state:
+
+  * `estimate_request_tokens` - a documented, deliberately conservative
+    ESTIMATE, not a token count. Every figure derived from it is named `est_*`
+    and must be read as approximate.
+  * `fit_messages_to_budget` - selectively compacts the model-facing copy of a
+    message list, oldest/least-relevant material first, stopping as soon as the
+    request fits. Normal passes reduce only tool observations and older
+    assistant prose. If normal compaction is insufficient, a bounded fallback
+    compaction strategy further compacts the newest tool observation, auxiliary
+    system-data status messages, and oldest complete AI-turn groups while
+    preserving all system instructions, the user's current request, and
+    tool-call / tool-result pairing integrity. If the essential content still
+    exceeds the budget, `fits` is False and `essential_unfittable` is True.
+  * `fit_evidence_items_to_budget` - bounds the serialized JSON representation
+    of grader and conclusion-validation evidence items without mutating run
+    state or enforcing a minimum excerpt size that exceeds the available budget.
+  * `ContextBudgetExceededError` - raised before sending when a request remains
+    unfittable after bounded compaction, so unfittable requests are never
+    knowingly sent to the provider.
+  * `is_context_size_error` / `retry_budget_for` - generic classification of a
+    provider failure as "request too large" and a tighter budget for a bounded
+    retry (used by `observability.invoke_model_logged`).
+
+Pure helpers: only message attributes (`type`, `content`, `tool_calls`) are
+read, so there are no LangChain imports here.
+"""
 
 from __future__ import annotations
 
