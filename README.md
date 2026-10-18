@@ -1,221 +1,192 @@
 # Agentic Repository Intelligence (ARI)
 
-**An agentic AI CLI assistant for understanding, investigating, and making guarded changes to software repositories.**
+**Ask questions about a codebase, trace how it works, and make guarded changes — from your terminal.**
 
-ARI answers questions about a local codebase using repository-grounded evidence rather than relying on unverified model assumptions. It combines deterministic AST indexing, static call/import graph resolution, BM25+ lexical retrieval, and a single bounded LangGraph agent with direct access to repository analysis, modification, and verification tools.
+ARI is a Python CLI assistant that investigates a local repository using indexed code structure and source-backed evidence. It combines Python AST analysis, a repository relationship graph, BM25+ search, and a bounded LangGraph agent. When changes are requested, ARI uses guarded write and verification workflows rather than treating every model-generated action as safe.
 
-## What ARI Does (and Does Not Do)
 
-**What it does:**
-- Indexes local repositories (Python AST symbols, call/import/inheritance graphs, and text/documentation chunks).
-- Routes all user queries through a single bounded LangGraph agent (`deep_agent.py`) that decides which repository tools (`search_repository`, `find_symbol`, `get_symbol`, `find_callers`, `find_callees`, `find_importers`, `get_dependencies`, `get_file`, `get_ast`, `find_files`) to invoke.
-- Tracks evidence provenance and cites exact repository-relative file paths and line ranges (`path:start-end`), grading acceptance criteria and validating citations before presenting the final conclusion.
-- Enforces capability gating (`READ` vs `WRITE` vs `EXECUTE`), command allowlists (`validate_command_safety`), and automatic filesystem checkpoints (`MutationTransaction`) with rollback on failed repairs or unauthorized command mutations.
+## Highlights
 
-**What it does not do:**
-- It is a CLI demonstration and learning project, not a production-hardened autonomous software engineer or OS-level container sandbox.
-- It does not provide a web UI or GUI.
-- Its static AST call/import graph targets Python source files; non-Python text/config/markdown files are indexed as searchable text chunks without AST symbol extraction.
-- Static call resolution cannot resolve dynamic dispatch (`getattr`, callbacks, runtime polymorphism) and reports unresolved receiver calls separately as `possible_callers` / `possible_callees`.
+- **Repository-aware answers** — search code and documentation, locate symbols, and inspect implementations.
+- **Code relationship analysis** — explore callers, callees, imports, dependencies, and inheritance relationships.
+- **Evidence-grounded responses** — answers can reference repository paths and line ranges instead of relying only on model knowledge.
+- **Guarded code changes** — scoped write access, command safety checks, checkpoints, verification, and rollback support.
+- **Bounded agent workflow** — a single LangGraph agent coordinates investigation and tool use within configured limits.
+- **Token-conscious context** — observations and prior context are compacted to help control model request size.
+- **Terminal-first interface** — interactive sessions, one-shot queries, status, refresh, and plain-output mode.
 
-## Architecture
+## How it works
 
 ```mermaid
 flowchart TD
-    A["User Query / CLI Task (main.py)"] --> B["Application Setup (app.py)"]
-    B --> C["RepoService & Index (service.py / indexer.py / graph.py / retrieval.py)"]
-    C --> D["Single LangGraph Main Agent (deep_agent.py)"]
-    D --> E["Plan Task & Derive Capabilities (plan.py / intent.py)"]
-    E --> F["Decide Next Action(s) (up to 3 read-only calls/turn)"]
-    F -->|"Read-only tools (search_repository, find_symbol, get_file, ...)"| G["Direct Repository Tools (tools.py)"]
-    F -->|"Guarded write / verify / command"| H["MutationTransaction & Checkpoint Guard (safety.py)"]
-    H --> I["Scoped Verification / Bounded Repair / Rollback (verification.py)"]
-    G --> J["Update State, Provenance & Progress Ledger (execution.py)"]
-    I --> J
-    J --> K["Evidence Grading & Claim Validation (evidence.py)"]
-    K --> L{"Supported or Step Budget Reached?"}
-    L -->|"Continue within bounds"| F
-    L -->|"Conclude"| M["Cited Markdown Answer + Evidence Table"]
+    A[Question or change request] --> B[Repository index]
+    B --> C[AST symbols, text chunks, relationship graph]
+    C --> D[Lexical retrieval and repository tools]
+    D --> E[Bounded LangGraph agent]
+    E --> F[Evidence and citation checks]
+    E --> G[Guarded write or command]
+    G --> H[Verification and rollback when needed]
+    F --> I[Answer with repository evidence]
+    H --> I
 ```
 
-## Key Components
+## Example questions
 
-| Component | Responsibility |
-|---|---|
-| `src/agentrepo/indexer.py`, `collector.py`, `resolver.py` | Collects repository files, parses Python ASTs into `Symbol` and `Chunk` records, and resolves cross-file `CONTAINS`, `IMPORTS`, `INHERITS`, and `CALLS` edges. |
-| `src/agentrepo/graph.py` | In-memory forward/backward adjacency graph (`CodeGraph`) over resolved and ambiguous code relationships. |
-| `src/agentrepo/retrieval.py` | BM25+ lexical retriever (`LexicalRetriever`) with identifier splitting, morphological stemming, domain query expansion, and a built-in `BM25Plus` fallback if `rank-bm25` is absent. |
-| `src/agentrepo/service.py` | Unified `RepoService` interface for lexical search (`search_repository`), symbol/graph queries, bounded file reads/writes, filesystem checkpoints, diffs, rollbacks, and sanitized command execution. |
-| `src/agentrepo/agent/deep_agent.py` | Single-agent LangGraph orchestrator handling planning, tool batching, repeat/progress guards, evidence grading, claim validation, and deterministic fallback synthesis. |
-| `src/agentrepo/agent/safety.py` & `verification.py` | Per-invocation `MutationTransaction`, command allowlist validation (`validate_command_safety`), pre-mutation checkpoints, `py_compile` scoped syntax verification, and automatic rollback. |
-| `src/agentrepo/agent/evidence.py` | Tracks per-step provenance, verifies file/line-range citations, evaluates acceptance criteria, and synthesizes deterministic answers when model calls are rate-limited or empty. |
-| `src/agentrepo/agent/context_budget.py` | Bounds model request token usage via structure-aware observation compaction and prevents oversized requests from being sent. |
-| `src/agentrepo/agent/app.py` & `main.py` | CLI entry point, `RichTerminalUI` formatting, one-shot query mode, and interactive REPL (`help`, `status`, `refresh`, `exit`). |
+Run ARI against a repository and ask questions such as:
 
-## Supported Question Types
+- `Where is RepoService.refresh defined?`
+- `Who calls index_repository?`
+- `What does collect_module call?`
+- `Which modules import agentrepo.filesystem?`
+- `Explain how a query flows through the agent`
+- `What configuration variables does this project support?`
+- `Add input validation to this function and verify the change`
 
-All queries enter the normal agent workflow (`requires GROQ_API_KEY`) and are answered using indexed repository tools:
-1. **Symbol Definitions & Locations:**
-   - *"Where is RepoService.refresh defined?"*
-   - *"Where is CodeGraph.from_index located?"*
-2. **Function & Class Implementations:**
-   - *"How is path_to_module implemented?"*
-   - *"Show the implementation of collect_module."*
-3. **Callers, Callees, Importers & Dependencies:**
-   - *"Who calls index_repository?"*
-   - *"What does collect_module call?"*
-   - *"Which modules import agentrepo.filesystem?"*
-   - *"What are the dependencies of agentrepo.service?"*
-4. **Documentation, Purpose, Module Inventory & Configuration:**
-   - *"What is the purpose of this repository?"*
-   - *"What are the main modules in this repository?"*
-   - *"What environment variables are supported?"*
-   - *"What accuracy scores were obtained?"*
-5. **Missing / Unsupported Symbol & Topic Detection:**
-   - *"Where is KubernetesClusterManager defined?"* -> Reports `UNSUPPORTED` honestly when repository searches find no matching symbol or evidence.
-6. **Multi-Step Cross-File Investigation & Guarded Code Changes:**
-   - *"Trace how a question flows through run_query, LazyDeepAgent, and build_deep_agent."*
-   - *"Modify pkg/core.py to add input validation and run verification."*
+ARI can also report when the indexed repository does not provide enough evidence. Treat that result as a useful boundary—not as proof that a feature does not exist anywhere.
 
-## Free-Tier & Token-Budget Optimizations
+## Requirements
 
-ARI is tuned for free-tier LLM quotas and small per-request token budgets:
-- **Single Bounded Retry (`max_retries=1`):** `ChatGroq` is configured with `max_retries=1` (`src/agentrepo/agent/model.py`) so rate-limit (`HTTP 429`) errors do not burn quota in retry loops.
-- **Fatal Provider Error Short-Circuiting:** If `plan_task` or `decide` encounters an authentication (`401`/`403`), rate-limit (`429`), or connection failure, downstream nodes skip redundant LLM calls and synthesize deterministically from any gathered evidence.
-- **Lookup Planning Bypass (`is_lookup_task`):** Simple read-only lookups that enter the agent graph skip the upfront `planning` LLM call.
-- **Deterministic Exact-Source Follow-Up (`followups.py`):** When `find_files` or `find_symbol` returns a single unambiguous match, `prepare_followup` automatically schedules the corresponding `get_file` read without an extra decision LLM call.
-- **Context Compaction (`MODEL_CONTEXT_TOKEN_BUDGET=6500`):** Tool observations and older turns are compacted at whole-line boundaries before every model call.
+- Python **3.10+**
+- A Gemini API key
+- Git is optional
 
-## Prerequisites & Installation
+## Setup
 
-- **Python:** 3.10 or newer
-- **Git:** Optional (used for read-only repository status metadata when available)
-- **Groq API Key:** Required (`GROQ_API_KEY`) to execute queries through the agent.
+### 1. Clone the repository
 
-### 1. Create and activate a virtual environment
-
-**Linux / macOS:**
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+git clone <your-repository-url>
+cd <repository-directory>
 ```
 
-**Windows (PowerShell):**
+### 2. Create a virtual environment
+
+**Windows PowerShell**
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-### 2. Install dependencies
+**Linux / macOS**
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+### 3. Install dependencies
 
 ```bash
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-*(Note: `src/agentrepo/retrieval.py` and `src/agentrepo/agent/state.py` also include built-in fallbacks so core indexing and retrieval modules can import cleanly in minimal offline environments.)*
+### 4. Configure Gemini
 
-## Configuration
-
-Copy `.env.example` to `.env` in the project root and supply your settings:
+Create a `.env` file in the project root and add your Gemini API key. Use the variable names supported by your local `.env.example` and configuration module; never commit the real key.
 
 ```dotenv
-GROQ_API_KEY=your_groq_api_key_here
-GROQ_MODEL=openai/gpt-oss-120b
-GROQ_TEMPERATURE=0
-MAX_AGENT_STEPS=8
-MAX_PLAN_STEPS=8
-MAX_OBSERVATION_CHARS=6000
-MAX_REPAIR_ATTEMPTS=2
-VERIFICATION_COMMAND=
-COMMAND_TIMEOUT_SECONDS=60
-ENABLE_CHECKPOINTS=true
-ROLLBACK_ON_REPAIR_LIMIT=true
-MODEL_CONTEXT_TOKEN_BUDGET=6500
+GOOGLE_API_KEY=your_gemini_api_key_here
+GEMINI_MODEL=gemini-3.5-flash-lite
 ```
 
-| Setting | Default | Purpose |
-|---|---|---|
-| `GROQ_API_KEY` | *(none)* | Groq API key for running the LLM-backed repository agent. |
-| `GROQ_MODEL` | `openai/gpt-oss-120b` | Tool-calling model identifier on Groq. |
-| `GROQ_TEMPERATURE` | `0` | Sampling temperature (`0` to `2`). |
-| `MAX_AGENT_STEPS` | `8` | Maximum tool-using LLM turns before forced wrap-up (`1`–`100`). |
-| `MAX_PLAN_STEPS` | `8` | Maximum planned steps (`1`–`50`). |
-| `MAX_OBSERVATION_CHARS` | `6000` | Maximum characters per tool observation (`1`–`100000`). |
-| `MAX_REPAIR_ATTEMPTS` | `2` | Maximum repair attempts after a failed modification/verification (`1`–`10`). |
-| `VERIFICATION_COMMAND` | `""` | Optional repository verification command (e.g. `pytest`). |
-| `COMMAND_TIMEOUT_SECONDS` | `60` | Subprocess timeout in seconds (`1`–`300`). |
-| `ENABLE_CHECKPOINTS` | `true` | Snapshot repository before writes/commands and roll back failed changes. |
-| `ROLLBACK_ON_REPAIR_LIMIT` | `true` | Restore snapshot when unrepaired modifications end in failure. |
-| `MODEL_CONTEXT_TOKEN_BUDGET` | `6500` | Estimated token budget per model request (`1000`–`1000000`). |
+If your checkout uses different environment-variable names, follow `.env.example` and `src/agentrepo/agent/config.py` as the source of truth.
 
 ## Usage
 
-### 1. Build a saved repository index (optional but recommended)
-
-Save `symbols.json`, `graph.json`, and `chunks.json` to an external index directory (must be outside the target repository):
+### Ask one question
 
 ```bash
-python scripts/build_index.py /path/to/repository /tmp/my_repo_index
+python main.py --repo /path/to/repository --query "Where is RepoService.refresh defined?"
 ```
 
-### 2. Run a one-shot query
-
-With a saved index:
-```bash
-python main.py --repo /path/to/repository --index-dir /tmp/my_repo_index --query "Where is RepoService.refresh defined?"
+**Windows example**
+```powershell
+python main.py --repo "D:\projects\my-repo" --query "Who calls index_repository?"
 ```
 
-Or index in memory automatically (omit `--index-dir`):
-```bash
-python main.py --repo /path/to/repository --query "Who calls index_repository?"
-```
-
-Use `--plain` to disable Rich terminal panels/colors (useful for piping or logs) and `--debug` to print full tracebacks on errors.
-
-### 3. Run an interactive session
+### Start an interactive session
 
 ```bash
 python main.py --repo /path/to/repository
 ```
 
-Inside the interactive prompt (`Query > `), you can ask natural-language questions or use built-in session commands:
-- `help` or `?` — Display available commands and example questions.
-- `status` — Show active repository path, indexed file/symbol/edge/chunk counts, and model configuration.
-- `refresh` — Re-index the repository from disk after external edits.
-- `exit` or `quit` — Exit cleanly.
+At the `Query >` prompt, ask follow-up questions or use:
 
-## Troubleshooting
+| Command | Action |
+|---|---|
+| `help` or `?` | Show help and example queries |
+| `status` | Show the active repository and index/model status |
+| `refresh` | Re-index after repository files change |
+| `exit` or `quit` | End the session |
 
-- **`Error: Configuration error: GROQ_API_KEY is not set...`**
-  - Create a `.env` file from `.env.example` and set `GROQ_API_KEY`, or export it in your shell (`export GROQ_API_KEY=gsk_...`).
-- **`Error: index output directory must be outside the repository being indexed`**
-  - When running `scripts/build_index.py`, choose an output directory outside the target repository (e.g., `/tmp/ari_index` or `../ari_index`) so generated index JSON files do not pollute the target repository tree.
-- **`HTTP 429` / Rate Limit or `HTTP 413` / Request Too Large**
-  - Free-tier Groq accounts have strict tokens-per-minute (TPM) and tokens-per-day (TPD) limits. Lower `MODEL_CONTEXT_TOKEN_BUDGET` (e.g., `4500`), `MAX_OBSERVATION_CHARS` (e.g., `3500`), or `MAX_AGENT_STEPS` (e.g., `4`) in `.env`. When `429` occurs mid-run after evidence is gathered, ARI preserves the recorded evidence and synthesizes a deterministic fallback summary.
-- **`Error: Repository path does not exist or is not a directory`**
-  - Verify the path passed to `--repo` exists and is a directory.
+### Optional: save an index
 
-## Project Structure
+Build an index outside the repository being analyzed:
+
+```bash
+python scripts/build_index.py /path/to/repository /path/to/ari-index
+```
+
+Then reuse it:
+
+```bash
+python main.py --repo /path/to/repository --index-dir /path/to/ari-index \
+  --query "What are the main modules?"
+```
+
+Use `--plain` for plain terminal output and `--debug` for detailed error tracebacks.
+
+## Safety and limitations
+
+ARI includes safety mechanisms, but these do **not** make arbitrary code execution risk-free.
+
+- Write and execution capabilities are gated by the agent's policy.
+- Commands are checked against an allowlist/policy before execution.
+- Filesystem checkpoints and rollback can help recover from failed changes.
+- Verification is scoped and configurable; it is not a guarantee that a change is correct.
+- Python AST analysis does not fully resolve dynamic dispatch, runtime-generated calls, or every framework convention.
+- Non-Python files can be indexed as text, but do not receive the same AST-level analysis.
+- Repository evidence can be incomplete. Review citations and verify important claims yourself.
+- Do not point ARI at sensitive or untrusted repositories unless you understand the configured tool permissions and command policy.
+
+## Configuration
+
+Configuration defaults are defined in `.env.example` and `src/agentrepo/agent/config.py`. Common controls in this project include:
+
+| Variable | Purpose |
+|---|---|
+| `MAX_AGENT_STEPS` | Limits the number of agent decision turns |
+| `MAX_PLAN_STEPS` | Limits planned work |
+| `MAX_OBSERVATION_CHARS` | Caps individual tool observations |
+| `MAX_REPAIR_ATTEMPTS` | Limits repair attempts after failed verification |
+| `COMMAND_TIMEOUT_SECONDS` | Sets command timeout |
+| `ENABLE_CHECKPOINTS` | Enables filesystem checkpoints |
+| `ROLLBACK_ON_REPAIR_LIMIT` | Controls rollback after exhausted repair attempts |
+| `MODEL_CONTEXT_TOKEN_BUDGET` | Caps estimated model context per request |
+
+
+## Project layout
 
 ```text
-ARI_Final_Agent_First_Clean/
+.
 ├── main.py
 ├── requirements.txt
-├── README.md
 ├── .env.example
 ├── .gitignore
-├── docs/
-│   └── FINAL_TECHNICAL_ANALYSIS.md
+│
 ├── scripts/
 │   └── build_index.py
-├── tests/
-│   ├── test_checkpoints_and_rollback.py
-│   ├── test_command_policy_and_safety.py
-│   ├── test_concurrency_and_isolation.py
-│   ├── test_context_budget_and_single_agent.py
-│   ├── test_lifecycle.py
-│   ├── test_query_answering.py
-│   └── test_source_scope_and_evidence.py
+│
+├── data/
+│   ├── symbols.json
+│   ├── graph.json
+│   ├── chunks.json
+│   ├── airepo/
+│   ├── rich_repo/
+│   ├── rich_repo_idx/
+│   ├── synth_out/
+│   └── vqa/
+│
 └── src/
     └── agentrepo/
         ├── __init__.py
@@ -230,6 +201,7 @@ ARI_Final_Agent_First_Clean/
         ├── retrieval.py
         ├── service.py
         ├── tools.py
+        │
         └── agent/
             ├── __init__.py
             ├── app.py
@@ -252,3 +224,4 @@ ARI_Final_Agent_First_Clean/
             ├── utils.py
             └── verification.py
 ```
+
