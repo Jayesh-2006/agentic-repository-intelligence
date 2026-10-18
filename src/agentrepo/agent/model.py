@@ -12,6 +12,8 @@ def build_llm(config: AgentConfig):
     # even if langchain-groq is not installed.
     from langchain_groq import ChatGroq
 
-    # max_retries: one transient 429/5xx must not end the whole run.
+    # Keep provider retries bounded. In particular, repeated 429 retries do
+    # not help when the account is out of quota and delay the evidence-backed
+    # fallback path.
     return ChatGroq(model=config.model, temperature=config.temperature, api_key=config.api_key,
-                    max_retries=4, timeout=90)
+                    max_retries=1, timeout=90)

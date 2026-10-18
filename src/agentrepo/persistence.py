@@ -7,6 +7,7 @@ import os
 import tempfile
 from pathlib import Path
 
+from .filesystem import is_within
 from .graph import CodeGraph
 from .models import RepositoryIndex, Symbol, Edge, Chunk, FileRecord
 
@@ -32,15 +33,11 @@ def _write_json(path: Path, value) -> None:
 
 
 def save_index(index: RepositoryIndex, out_dir: str | Path) -> None:
-    out_dir = Path(out_dir).expanduser().resolve()
-    root = Path(index.root).expanduser().resolve()
-    try:
-        out_dir.relative_to(root)
-    except ValueError:
-        pass
-    else:
+    out_dir_resolved = Path(out_dir).expanduser().resolve()
+    root_resolved = Path(index.root).expanduser().resolve()
+    if is_within(root_resolved, out_dir_resolved):
         raise ValueError("index output directory must be outside the repository being indexed")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir_resolved.mkdir(parents=True, exist_ok=True)
 
     files_and_symbols = {
         "root": index.root,
@@ -48,9 +45,9 @@ def save_index(index: RepositoryIndex, out_dir: str | Path) -> None:
         "repo_files": index.repo_files,
         "symbols": {k: v.to_dict() for k, v in index.symbols.items()},
     }
-    _write_json(out_dir / "symbols.json", files_and_symbols)
-    _write_json(out_dir / "graph.json", [e.to_dict() for e in index.edges])
-    _write_json(out_dir / "chunks.json", {k: v.to_dict() for k, v in index.chunks.items()})
+    _write_json(out_dir_resolved / "symbols.json", files_and_symbols)
+    _write_json(out_dir_resolved / "graph.json", [e.to_dict() for e in index.edges])
+    _write_json(out_dir_resolved / "chunks.json", {k: v.to_dict() for k, v in index.chunks.items()})
 
 
 def load_index(index_dir: str | Path) -> tuple[RepositoryIndex, CodeGraph]:
@@ -61,18 +58,27 @@ def load_index(index_dir: str | Path) -> tuple[RepositoryIndex, CodeGraph]:
         if not (index_dir / name).is_file():
             raise FileNotFoundError(f"{index_dir / name} not found - run scripts/build_index.py first")
 
-    symbols_data = json.loads((index_dir / "symbols.json").read_text(encoding="utf-8"))
-    edges_data = json.loads((index_dir / "graph.json").read_text(encoding="utf-8"))
-    chunks_data = json.loads((index_dir / "chunks.json").read_text(encoding="utf-8"))
-
-    index = RepositoryIndex(
-        root=symbols_data["root"],
-        files=[FileRecord(**f) for f in symbols_data["files"]],
-        repo_files=symbols_data.get("repo_files"),  # None (missing key, or an explicit null from
-                                                     # to_dict) means this index predates find_files
-                                                     # / has no full listing - see models.RepositoryIndex.
-        symbols={k: Symbol(**v) for k, v in symbols_data["symbols"].items()},
-        edges=[Edge(**e) for e in edges_data],
-        chunks={k: Chunk(**v) for k, v in chunks_data.items()},
-    )
+    try:
+        symbols_data = json.loads((index_dir / "symbols.json").read_text(encoding="utf-8"))
+        edges_data = json.loads((index_dir / "graph.json").read_text(encoding="utf-8"))
+        chunks_data = json.loads((index_dir / "chunks.json").read_text(encoding="utf-8"))
+        if (
+            not isinstance(symbols_data, dict)
+            or not isinstance(symbols_data.get("root"), str)
+            or not isinstance(symbols_data.get("files"), list)
+            or not isinstance(symbols_data.get("symbols"), dict)
+            or not isinstance(edges_data, list)
+            or not isinstance(chunks_data, dict)
+        ):
+            raise ValueError("persisted index JSON has an invalid top-level structure")
+        index = RepositoryIndex(
+            root=symbols_data["root"],
+            files=[FileRecord(**f) for f in symbols_data["files"]],
+            repo_files=symbols_data.get("repo_files"),
+            symbols={k: Symbol(**v) for k, v in symbols_data["symbols"].items()},
+            edges=[Edge(**e) for e in edges_data],
+            chunks={k: Chunk(**v) for k, v in chunks_data.items()},
+        )
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ValueError(f"corrupt or incompatible index in {index_dir}: {exc}") from exc
     return index, CodeGraph.from_index(index)

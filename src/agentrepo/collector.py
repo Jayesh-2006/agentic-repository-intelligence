@@ -16,7 +16,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .models import Symbol
-from .module_naming import path_to_module
 
 
 @dataclass

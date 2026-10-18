@@ -5,22 +5,24 @@ Agent configuration, read from environment variables (and a local .env file).
     GROQ_MODEL         default: openai/gpt-oss-120b (a Groq model with tool calling)
     GROQ_TEMPERATURE   default: 0
     MAX_AGENT_STEPS       default: 8  (max tool-using LLM turns before a forced final answer)
-    MAX_PLAN_STEPS        default: 8  (max steps the Deep Agent's upfront planning call may
+    MAX_PLAN_STEPS        default: 8  (max steps the upfront planning call may
                                        propose, and max PENDING steps a revise_plan call may set)
-    MAX_EXPLORER_STEPS    default: 6  (max tool-using turns for the Explorer sub-agent)
-    MAX_CODER_STEPS       default: 6  (max tool-using turns for the Coder sub-agent)
-    MAX_DEBUGGER_STEPS    default: 6  (max tool-using turns for the Debugger sub-agent)
-    MAX_REPAIR_ATTEMPTS   default: 2  (max Debugger invocations in the verification/repair loop)
-    Hard ceilings: agent/sub-agent iterations 100, plan steps 50, repair attempts 10,
+    MAX_OBSERVATION_CHARS default: 6000  (maximum characters returned per tool observation)
+    MAX_REPAIR_ATTEMPTS   default: 2  (max repair attempts in the modification/verification loop)
+    Hard ceilings: agent iterations 100, plan steps 50, repair attempts 10,
                    observation characters 100,000, command timeout 300 seconds.
     VERIFICATION_COMMAND  optional repository-specific verification command
     COMMAND_TIMEOUT_SECONDS default: 60  (timeout for the automatic verification command)
-    ENABLE_CHECKPOINTS    default: true  (roll the repository back after repair limit;
-                                          a baseline snapshot is always taken to detect command mutations)
-    ROLLBACK_ON_REPAIR_LIMIT default: true  (when the repair loop exhausts
-                                          MAX_REPAIR_ATTEMPTS and verification is still
-                                          failing, restore the repository to its
-                                          pre-task checkpoint)
+    ENABLE_CHECKPOINTS    default: true  (snapshot repository before protected writes/commands and
+                                          roll back failed unrepaired changes on termination)
+    MODEL_CONTEXT_TOKEN_BUDGET default: 6500  (estimated-token budget for ONE model request,
+                                          tool schemas included; older tool observations are
+                                          compacted to fit. Keep it safely below the provider's
+                                          per-request/TPM limit; range 1000-1,000,000. The
+                                          estimate is deliberately conservative - see
+                                          context_budget.py)
+    ROLLBACK_ON_REPAIR_LIMIT default: true  (when an unrepaired change ends in failure,
+                                          restore the repository to its pre-task checkpoint)
 
 This module only requires python-dotenv; it can load configuration without
 LangChain, LangGraph, or an API key.
@@ -38,22 +40,23 @@ DEFAULT_MODEL = "openai/gpt-oss-120b"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_MAX_STEPS = 8
 DEFAULT_MAX_PLAN_STEPS = 8
-DEFAULT_MAX_EXPLORER_STEPS = 6
-DEFAULT_MAX_CODER_STEPS = 6
-DEFAULT_MAX_DEBUGGER_STEPS = 6
 DEFAULT_MAX_REPAIR_ATTEMPTS = 2
 DEFAULT_VERIFICATION_COMMAND = ""
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 60
 DEFAULT_MAX_OBSERVATION_CHARS = 6000
 DEFAULT_ENABLE_CHECKPOINTS = True
 DEFAULT_ROLLBACK_ON_REPAIR_LIMIT = True
+# Sized for an 8,000-token provider request limit with headroom (the estimator
+# in context_budget.py over-counts, and tool schemas are counted inside it).
+DEFAULT_CONTEXT_TOKEN_BUDGET = 6500
+MIN_CONTEXT_TOKEN_BUDGET = 1000
+MAX_CONTEXT_TOKEN_BUDGET = 1_000_000
 # Must match RepoService.MAX_COMMAND_TIMEOUT (service.py). Duplicated here
 # rather than imported so this module keeps working without the rest of the
 # package's (stdlib-only, but heavier) dependencies - see the module docstring.
 MAX_COMMAND_TIMEOUT_SECONDS = 300
 MAX_AGENT_STEPS = 100
 MAX_PLAN_STEPS = 50
-MAX_SUBAGENT_STEPS = 100
 MAX_REPAIR_ATTEMPTS = 10
 MAX_OBSERVATION_CHARS = 100_000
 
@@ -74,9 +77,6 @@ class AgentConfig:
     max_agent_steps: int = DEFAULT_MAX_STEPS
     max_plan_steps: int = DEFAULT_MAX_PLAN_STEPS
     max_observation_chars: int = DEFAULT_MAX_OBSERVATION_CHARS
-    max_explorer_steps: int = DEFAULT_MAX_EXPLORER_STEPS
-    max_coder_steps: int = DEFAULT_MAX_CODER_STEPS
-    max_debugger_steps: int = DEFAULT_MAX_DEBUGGER_STEPS
     max_repair_attempts: int = DEFAULT_MAX_REPAIR_ATTEMPTS
     verification_command: str = DEFAULT_VERIFICATION_COMMAND
     command_timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS
@@ -88,9 +88,6 @@ class AgentConfig:
             "max_agent_steps": (1, MAX_AGENT_STEPS),
             "max_plan_steps": (1, MAX_PLAN_STEPS),
             "max_observation_chars": (1, MAX_OBSERVATION_CHARS),
-            "max_explorer_steps": (1, MAX_SUBAGENT_STEPS),
-            "max_coder_steps": (1, MAX_SUBAGENT_STEPS),
-            "max_debugger_steps": (1, MAX_SUBAGENT_STEPS),
             "max_repair_attempts": (1, MAX_REPAIR_ATTEMPTS),
             "command_timeout_seconds": (1, MAX_COMMAND_TIMEOUT_SECONDS),
         }
@@ -118,9 +115,6 @@ def load_config(require_api_key: bool = True, env: Mapping[str, str] | None = No
     max_steps = _parse(env, "MAX_AGENT_STEPS", int, DEFAULT_MAX_STEPS)
     max_plan_steps = _parse(env, "MAX_PLAN_STEPS", int, DEFAULT_MAX_PLAN_STEPS)
     max_observation_chars = _parse(env, "MAX_OBSERVATION_CHARS", int, DEFAULT_MAX_OBSERVATION_CHARS)
-    max_explorer_steps = _parse(env, "MAX_EXPLORER_STEPS", int, DEFAULT_MAX_EXPLORER_STEPS)
-    max_coder_steps = _parse(env, "MAX_CODER_STEPS", int, DEFAULT_MAX_CODER_STEPS)
-    max_debugger_steps = _parse(env, "MAX_DEBUGGER_STEPS", int, DEFAULT_MAX_DEBUGGER_STEPS)
     max_repair_attempts = _parse(env, "MAX_REPAIR_ATTEMPTS", int, DEFAULT_MAX_REPAIR_ATTEMPTS)
     verification_command = (env.get("VERIFICATION_COMMAND") or "").strip() or DEFAULT_VERIFICATION_COMMAND
     command_timeout_seconds = _parse(env, "COMMAND_TIMEOUT_SECONDS", int, DEFAULT_COMMAND_TIMEOUT_SECONDS)
@@ -128,15 +122,24 @@ def load_config(require_api_key: bool = True, env: Mapping[str, str] | None = No
     rollback_on_repair_limit = _parse_bool(env, "ROLLBACK_ON_REPAIR_LIMIT", DEFAULT_ROLLBACK_ON_REPAIR_LIMIT)
     if not 0.0 <= temperature <= 2.0:
         raise ConfigError(f"GROQ_TEMPERATURE must be between 0 and 2, got {temperature}")
+    load_context_token_budget(env)  # fail fast on an invalid value; used at request time
     return AgentConfig(api_key=api_key, model=model, temperature=temperature,
                        max_agent_steps=max_steps, max_plan_steps=max_plan_steps,
                        max_observation_chars=max_observation_chars,
-                       max_explorer_steps=max_explorer_steps,
-                       max_coder_steps=max_coder_steps, max_debugger_steps=max_debugger_steps,
                        max_repair_attempts=max_repair_attempts, verification_command=verification_command,
                        command_timeout_seconds=command_timeout_seconds,
                        enable_checkpoints=enable_checkpoints,
                        rollback_on_repair_limit=rollback_on_repair_limit)
+
+
+def load_context_token_budget(env: Mapping[str, str] | None = None) -> int:
+    """MODEL_CONTEXT_TOKEN_BUDGET, validated (default DEFAULT_CONTEXT_TOKEN_BUDGET)."""
+    env = os.environ if env is None else env
+    value = _parse(env, "MODEL_CONTEXT_TOKEN_BUDGET", int, DEFAULT_CONTEXT_TOKEN_BUDGET)
+    if not MIN_CONTEXT_TOKEN_BUDGET <= value <= MAX_CONTEXT_TOKEN_BUDGET:
+        raise ConfigError(f"MODEL_CONTEXT_TOKEN_BUDGET must be between {MIN_CONTEXT_TOKEN_BUDGET} "
+                          f"and {MAX_CONTEXT_TOKEN_BUDGET}, got {value!r}")
+    return value
 
 
 def _parse(env: Mapping[str, str], name: str, cast, default):

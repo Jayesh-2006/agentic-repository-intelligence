@@ -1,4 +1,4 @@
-"""Deterministic request intent, routing, and capability limits.
+"""Deterministic request intent, routing, source-scope enforcement, and capability limits.
 
 An intent is a JSON-safe dictionary:
 
@@ -6,13 +6,18 @@ An intent is a JSON-safe dictionary:
      "depth": "minimal" | "standard" | "deep",
      "rigor": "light" | "standard" | "strict",
      "answer_style": "short" | "normal" | "detailed",
-     "sources": ["optional/path/to/file", ...]}
+     "sources": ["optional/path/to/file", ...],
+     "scope": {"mentioned": [...], "starting_points": [...], "targets": [...], "cross_file": bool}}
 
-"check" (not "verify") is used for the intent kind specifically to avoid
-confusion with the existing `verify_repository` delegation tool and
-`DeepAgentState.verification_info` - those are about running the
-repository's real test/verification command, which is unrelated to what
-KIND of request the user made.
+`sources` is the ONLY hard read/scope restriction: it is set only when the user
+explicitly limits investigation to particular files, and it is what tool
+authorization enforces across the full repository tool suite. `scope` is
+advisory structure about the files a request merely mentions: a mentioned file
+does not restrict the repository; starting points are where tracing should
+begin; targets are what the user wants explained/inspected/changed; `cross_file`
+says investigation may follow imports, callers and data flow elsewhere. Read
+scope is separate from mutation authorization (`capabilities_for_floor`), which
+never looks at `scope` or `sources`.
 
 The deterministic floor captures explicit user constraints. A planner may
 raise intent values but cannot lower that floor. State readers tolerate
@@ -25,14 +30,13 @@ older or hand-built states without an intent value:
 
 from __future__ import annotations
 
-import json
 import posixpath
 import re
-from typing import Optional
+from typing import Any, Optional
 
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
-from .plan import _CODE_FENCE_RE
+from .json_utils import parse_json_object
 
 # --------------------------------------------------------------- enums
 
@@ -67,6 +71,11 @@ class Intent(TypedDict):
     rigor: str
     answer_style: str
     sources: list[str]
+    scope: NotRequired[dict]
+
+
+def empty_scope() -> dict:
+    return {"mentioned": [], "starting_points": [], "targets": [], "cross_file": False}
 
 
 def default_intent() -> Intent:
@@ -74,7 +83,7 @@ def default_intent() -> Intent:
     planner-proposed intent - applies. Deliberately the most permissive,
     middle-of-the-road choice on every axis."""
     return {"kind": KIND_EXPLAIN, "depth": DEPTH_STANDARD, "rigor": RIGOR_STANDARD,
-            "answer_style": STYLE_NORMAL, "sources": []}
+            "answer_style": STYLE_NORMAL, "sources": [], "scope": empty_scope()}
 
 
 def get_intent(state: dict) -> Intent:
@@ -126,9 +135,7 @@ _STYLE_SYNONYMS = {
 
 
 def _normalize_enum(value, synonyms: dict, valid: tuple, default: str) -> str:
-    """Lowercase + synonym-map an enum value from an untrusted (LLM) source.
-    Anything unrecognised falls back to `default` rather than raising -
-    the planner's own wording is never trusted verbatim."""
+    """Lowercase + synonym-map an enum value from an untrusted (LLM) source."""
     if not isinstance(value, str):
         return default
     key = value.strip().lower()
@@ -139,49 +146,210 @@ def _normalize_enum(value, synonyms: dict, valid: tuple, default: str) -> str:
 
 def normalize_source_path(raw: str) -> str:
     """Normalize obvious path-formatting differences (./README.md vs
-    README.md, backslashes vs forward slashes, a safe ".." normalization)
-    WITHOUT case-folding - matching is left case-sensitive on purpose, so
-    this never silently selects a different file on a case-sensitive
-    filesystem. Returns "" for input that normalizes to nothing usable."""
+    README.md, backslashes vs forward slashes) WITHOUT case-folding and WITHOUT
+    allowing absolute paths or parent-directory (..) traversal.
+    Returns "" for input that normalizes to nothing usable or attempts traversal."""
     if not isinstance(raw, str):
         return ""
     text = raw.strip().replace("\\", "/")
-    if not text:
+    if not text or "\x00" in text:
+        return ""
+    if text.startswith("/") or (len(text) >= 2 and text[1] == ":"):
+        return ""
+    raw_parts = [p for p in text.split("/") if p and p != "."]
+    if ".." in raw_parts:
         return ""
     normalized = posixpath.normpath(text)
-    if normalized in (".", ""):
+    if normalized in (".", "", "..") or normalized.startswith("../") or normalized.startswith("/"):
         return ""
-    # Drop any ".." segments rather than let a restriction climb outside the
-    # repo - this is intent bookkeeping only, not the actual file guard
-    # so the safe thing here is simply to ignore escape attempts.
-    parts = [p for p in normalized.split("/") if p and p != ".."]
+    parts = [p for p in normalized.split("/") if p and p != "."]
+    if not parts or ".." in parts:
+        return ""
     return "/".join(parts)
 
 
-def source_allows_path(intent: dict, path: str) -> bool:
-    """Whether a DIRECT get_file call for `path` is authorized by
-    this invocation's `sources` restriction (see deep_agent.py's `decide`,
-    get_file branch). True when there is no restriction at all, or when
-    `path` - normalized the same way `sources` itself already was (see
-    `normalize_source_path`) - is exactly one of the restricted paths.
-
-    An explicit restriction such as "only read README.md" narrows what
-    get_file may retrieve; it must never be read as blanket permission for
-    get_file to read anything else. Deliberately exact-match, case-sensitive
-    (matching `normalize_source_path`'s own contract) - this is a safety
-    boundary, not a fuzzy lookup, so it never widens on a near-match."""
+def source_allows_path(intent: dict, path: str, service: Any = None) -> bool:
+    """Whether a file operation on `path` is authorized by this invocation's
+    `sources` restriction. True when there is no restriction at all, or when
+    `path` - normalized via `normalize_source_path` and verified against
+    symlinks/canonical containment when `service` is available - is one of the
+    restricted paths."""
     sources = intent.get("sources") or []
     if not sources:
         return True
-    return normalize_source_path(path) in set(sources)
+    norm = normalize_source_path(path)
+    if not norm or norm not in set(sources):
+        return False
+    if service is not None and getattr(service, "index", None) is not None:
+        root_str = getattr(service.index, "root", None)
+        if isinstance(root_str, str) and root_str:
+            from pathlib import Path
+            import os
+            from ..filesystem import is_within
+            try:
+                root = Path(root_str).resolve()
+                unresolved = Path(os.path.abspath(root / norm))
+                if not is_within(root, unresolved):
+                    return False
+                current = root
+                for part in unresolved.relative_to(root).parts:
+                    current = current / part
+                    if current.is_symlink():
+                        return False
+                resolved = unresolved.resolve()
+                if not is_within(root, resolved):
+                    return False
+                rel_posix = resolved.relative_to(root).as_posix()
+                if rel_posix not in set(sources):
+                    return False
+            except (OSError, RuntimeError, ValueError):
+                return False
+    return True
+
+
+def _structural_target_in_scope(
+    intent: dict,
+    tool_name: str,
+    target: str,
+    service: Any,
+) -> bool:
+    """Return True only when a `get_symbol` or `get_ast` target and all of its
+    resulting data (including recursively nested child definitions and their
+    resolved outgoing edges) are demonstrably within the permitted `sources`
+    scope."""
+    if service is None or not isinstance(target, str) or not target.strip():
+        return False
+    index = getattr(service, "index", None)
+    graph = getattr(service, "graph", None)
+    find_matches = getattr(service, "_find_matches", None)
+    resolve_one = getattr(service, "_resolve_one", None)
+    if index is None or not callable(find_matches) or not callable(resolve_one):
+        return False
+
+    cleaned = target.strip()
+    if tool_name == "get_symbol":
+        matches, _ = find_matches(cleaned)
+        callable_matches = [m for m in matches if getattr(m, "kind", None) in ("function", "method", "class")]
+        if len(callable_matches) != 1 or len(matches) != 1:
+            return False
+        sym = callable_matches[0]
+        return bool(getattr(sym, "file", None) and source_allows_path(intent, sym.file, service=service))
+
+    if tool_name == "get_ast":
+        if cleaned.casefold().endswith(".py") or "/" in cleaned or "\\" in cleaned:
+            if not source_allows_path(intent, cleaned, service=service):
+                return False
+            sym, err = resolve_one(cleaned)
+            if err is not None or sym is None:
+                return False
+        else:
+            matches, _ = find_matches(cleaned)
+            if len(matches) != 1:
+                return False
+            sym = matches[0]
+        if not getattr(sym, "file", None) or not source_allows_path(intent, sym.file, service=service):
+            return False
+        if graph is None:
+            return False
+        symbols_map = getattr(index, "symbols", {}) or {}
+        edges_to_check: list[Any] = []
+        find_children = getattr(graph, "find_children", None)
+        visited_ids: set[str] = set()
+        queue: list[str] = [sym.id]
+        while queue:
+            current_id = queue.pop(0)
+            if not current_id or current_id in visited_ids:
+                continue
+            visited_ids.add(current_id)
+            edges_to_check.extend(graph.neighbors(current_id))
+            if callable(find_children):
+                for child_edge in find_children(current_id):
+                    edges_to_check.append(child_edge)
+                    child_id = getattr(child_edge, "target", "")
+                    if isinstance(child_id, str) and child_id and child_id not in visited_ids:
+                        queue.append(child_id)
+        for edge in edges_to_check:
+            if getattr(edge, "resolved", False):
+                target_sym = symbols_map.get(getattr(edge, "target", ""))
+                if target_sym is None or not getattr(target_sym, "file", None):
+                    return False
+                if not source_allows_path(intent, target_sym.file, service=service):
+                    return False
+        return True
+
+    return False
+
+
+def source_allows_tool(
+    intent: dict,
+    tool_name: str,
+    args: Optional[dict] = None,
+    service: Any = None,
+) -> tuple[bool, str]:
+    """Enforce explicit `sources` restrictions across the entire repository tool suite."""
+    sources = intent.get("sources") or []
+    if not sources or tool_name == "revise_plan":
+        return True, ""
+
+    safe_args = args or {}
+    if tool_name in ("get_file", "write_file"):
+        requested_path = str(safe_args.get("path") or "")
+        if source_allows_path(intent, requested_path, service=service):
+            return True, ""
+        action_desc = "direct file access" if tool_name == "get_file" else "file modification"
+        return (
+            False,
+            f"Source restriction (system data): this task restricts {action_desc} to "
+            f"{sources}, so {tool_name} was not run for {requested_path!r}. "
+            "Choose an explicitly allowed source or state that the restricted evidence could not "
+            "be established.",
+        )
+
+    if tool_name in ("get_symbol", "get_ast"):
+        target = str(safe_args.get("symbol") if tool_name == "get_symbol" else safe_args.get("target") or "")
+        if _structural_target_in_scope(intent, tool_name, target, service):
+            return True, ""
+        return (
+            False,
+            f"Source restriction (system data): this task is limited to {sources}. "
+            f"{tool_name}({target!r}) was blocked because its target or resolved relationships "
+            "are not demonstrably confined to the permitted file(s). Use get_file on an "
+            "explicitly allowed path instead.",
+        )
+
+    tool_labels = {
+        "find_symbol": "exact symbol lookup",
+        "search_repository": "repository content search",
+        "find_files": "repository file search",
+        "find_callers": "repository-wide caller search",
+        "find_callees": "cross-file callee resolution",
+        "find_importers": "repository-wide importer search",
+        "get_dependencies": "repository-wide dependency analysis",
+    }
+    if tool_name in tool_labels:
+        return (
+            False,
+            f"Source restriction (system data): {tool_labels[tool_name]} ({tool_name}) inspects the "
+            f"full repository, so it is unavailable for a task restricted to {sources}. "
+            "Use get_file only for an explicitly allowed path.",
+        )
+
+    return (
+        False,
+        f"Source restriction (system data): this task is limited to {sources}. "
+        f"The requested capability {tool_name!r} is not permitted because it could access other "
+        "repository paths. Use direct get_file only for an explicitly allowed path.",
+    )
+
+
+def delegation_allows(intent: dict, tool: str, args: Optional[dict] = None, service: Any = None) -> bool:
+    """Return whether `tool` is permitted by this invocation's explicit source restriction."""
+    allowed, _ = source_allows_tool(intent, tool, args=args, service=service)
+    return allowed
 
 
 def normalize_model_intent(raw) -> dict:
-    """Best-effort normalisation of a planner-supplied `intent` object
-    (parsed by `parse_intent_reply`). Only recognised keys are kept; every
-    value is normalized safely (see `_normalize_enum`) so a malformed or
-    unexpected planner reply can never raise - it just falls back per
-    field."""
+    """Best-effort normalisation of a planner-supplied `intent` object."""
     if not isinstance(raw, dict):
         return {}
     out: dict = {}
@@ -203,20 +371,10 @@ def normalize_model_intent(raw) -> dict:
 
 def parse_intent_reply(text: str) -> Optional[dict]:
     """Extract the raw (not yet normalized) "intent" object from the
-    planning call's JSON reply (see prompts.PLANNING_SYSTEM_PROMPT /
-    plan.parse_plan_steps / evidence.parse_criteria, which read the same
-    reply for "steps"/"criteria"). Returns None - never raises - when there
-    is nothing usable; the caller then relies on the deterministic floor
-    and defaults alone."""
-    cleaned = _CODE_FENCE_RE.sub("", (text or "").strip()).strip()
-    try:
-        data = json.loads(cleaned)
-    except (TypeError, ValueError):
-        return None
-    if isinstance(data, dict):
-        intent = data.get("intent")
-        if isinstance(intent, dict):
-            return intent
+    planning call's JSON reply."""
+    data = parse_json_object(text or "")
+    if data is not None and isinstance(data.get("intent"), dict):
+        return data["intent"]
     return None
 
 
@@ -224,25 +382,91 @@ def parse_intent_reply(text: str) -> Optional[dict]:
 
 _SHORT_RE = re.compile(r"\b(short|brief|concise|tl;?dr|one[\s-]sentence|one[\s-]line)\b", re.IGNORECASE)
 
-# Natural source limits such as "according to README.md", plus explicit
-# forms such as "only read README.md" / "use only README.md".
+# Source scope. Only an EXPLICIT limit ("only read X", "restrict yourself to X",
+# "based solely on X", "nothing other than X") is a hard read restriction. A
+# filename in an ordinary sentence ("in app.py", "from infer.py", "according to X")
+# is merely mentioned.
+_SOURCE_EXTENSIONS = (
+    "py|md|rst|txt|json|ya?ml|toml|ini|cfg|sh|csv|xml|html?|css|scss|js|jsx|ts|tsx|"
+    "go|rs|java|kt|c|h|cpp|hpp|sql|lock"
+)
+_SOURCE_PATH = rf"[\w./\\-]+\.(?:{_SOURCE_EXTENSIONS})\b"
+_PATH_RE = re.compile(_SOURCE_PATH, re.IGNORECASE)
+_PATH_LIST = rf"[\"']?{_SOURCE_PATH}[\"']?(?:\s*(?:,|&|\band\b)\s*[\"']?{_SOURCE_PATH}[\"']?)*"
+_ONLY = r"(?:only|solely|exclusively|just)"
 _SOURCE_RE = re.compile(
-    r"\b(?:according\s+to|based\s+on|from|in)\s+(?:file\s+)?[\"']?([\w./\\-]+\.\w+)"
-    r"|\b(?:only|just)\s+(?:read|use|check|look\s+at)\s+[\"']?([\w./\\-]+\.\w+)"
-    r"|\b(?:read|use|check|look\s+at)\s+only\s+[\"']?([\w./\\-]+\.\w+)"
-    r"|\bcheck\s+[\"']?([\w./\\-]+\.\w+)\s+only\b",
+    rf"\b{_ONLY}\s+(?:read|use|using|check|look\s+at|consult|rely\s+on|refer\s+to)\s+"
+    rf"(?:the\s+)?(?:files?\s+)?({_PATH_LIST})"
+    rf"|\b(?:read|use|check|look\s+at|consult|rely\s+on|refer\s+to|search|stay)\s+{_ONLY}\s+"
+    rf"(?:(?:in|inside|within|from|on)\s+)?(?:the\s+)?(?:files?\s+)?({_PATH_LIST})"
+    rf"|\b(?:(?:based|relying|drawing)\s+{_ONLY}|{_ONLY}\s+(?:based|relying|drawing))\s+(?:on|from)\s+(?:the\s+)?(?:files?\s+)?({_PATH_LIST})"
+    rf"|\b(?:restrict|limit|confine|constrain)\w*\s+(?:(?:your|the|this)\s+)?"
+    rf"(?:yourself|reading|reads|search(?:es)?|investigation|analysis|exploration|lookups?|sources?|files?|scope)\s+"
+    rf"to\s+(?:the\s+)?(?:files?\s+)?({_PATH_LIST})"
+    rf"|\b(?:(?:read|use|check|look\s+at|consult)\s+)?(?:nothing\s+(?:but|other\s+than)|no\s+(?:other\s+)?files?\s+(?:other\s+)?than)\s+"
+    rf"(?:the\s+)?(?:files?\s+)?({_PATH_LIST})"
+    rf"|\bcheck\s+({_PATH_LIST})\s+only\b",
     re.IGNORECASE,
 )
+_START_RE = re.compile(
+    rf"\b(?:start(?:ing)?|begin(?:ning)?)\s+(?:from|with|at|in)\s+(?:the\s+)?(?:files?\s+)?[\"']?({_SOURCE_PATH})"
+    rf"|\b(?:trace|follow|walk|explore|track)\w*\b[^.?!\n]{{0,60}}?\b(?:from|starting\s+(?:at|from|in))\s+"
+    rf"(?:the\s+)?(?:files?\s+)?[\"']?({_SOURCE_PATH})",
+    re.IGNORECASE,
+)
+_TARGET_RE = re.compile(
+    rf"\b(?:explain|describe|summari[sz]e|inspect|review|analy[sz]e|audit|open|read|show|"
+    rf"fix|edit|modify|update|change|refactor|rewrite|implement\s+in|add\s+(?:\w+\s+){{0,3}}?to)\s+"
+    rf"(?:me\s+)?(?:the\s+)?(?:file\s+)?[\"']?({_SOURCE_PATH})",
+    re.IGNORECASE,
+)
+_CROSS_FILE_RE = re.compile(
+    r"\b(?:across|trace|tracing|callers?|callees?|imports?|imported|depend\w*|data\s+flow|"
+    r"call\s+graph|who\s+calls|used\s+by|end[- ]to[- ]end|flows?\s+(?:from|through)|interacts?)\b",
+    re.IGNORECASE,
+)
+
+
+def _clean_paths(raw: list) -> list:
+    out: list = []
+    for item in raw:
+        path = normalize_source_path(item.strip("\"'"))
+        if path and path not in out:
+            out.append(path)
+    return out
+
+
+def extract_hard_sources(text: str) -> list:
+    """Paths the user explicitly limits investigation to (the hard read scope)."""
+    found: list = []
+    for match in _SOURCE_RE.finditer(text or ""):
+        group = next((g for g in match.groups() if g), "")
+        found.extend(_PATH_RE.findall(group))
+    return _clean_paths(found)
+
+
+def extract_scope(text: str, hard_sources: Optional[list] = None) -> dict:
+    """Structured, advisory scope for the request (see module docstring).
+    Never restricts anything by itself."""
+    text = text or ""
+    hard = extract_hard_sources(text) if hard_sources is None else list(hard_sources)
+    starting = _clean_paths([g for m in _START_RE.finditer(text) for g in m.groups() if g])
+    targets = _clean_paths([m.group(1) for m in _TARGET_RE.finditer(text)])
+    mentioned = _clean_paths(_PATH_RE.findall(text))
+    cross = not hard and bool(starting or _CROSS_FILE_RE.search(text))
+    return {"mentioned": mentioned, "starting_points": starting, "targets": targets, "cross_file": cross}
+
+
+def scope_of(intent: dict) -> dict:
+    return {**empty_scope(), **(intent.get("scope") or {})}
+
 
 _SERIOUS_RE = re.compile(
     r"\b(verify|audit|confirm|actually)\b|\bwhether\b.{0,40}\bimplemented\b",
     re.IGNORECASE,
 )
 
-# The user explicitly asking to RUN the repository's tests/checks. This is the
-# only read-only-kind request that may execute the configured verification
-# command (see capabilities_for_floor): "verify"/"audit"/"confirm" alone are
-# reading words and do not grant execution.
+# The user explicitly asking to RUN the repository's tests/checks.
 _RUN_CHECKS_RE = re.compile(
     r"\b(?:run|execute|re-?run)\b(?:\s+\w+){0,4}?\s+(?:tests?|test\s+suite|pytest|checks?|verification)\b"
     r"|\b(?:do|does|did)\b(?:\s+\w+){0,4}?\s+(?:tests?|test\s+suite)\s+(?:pass|fail)\b"
@@ -270,19 +494,10 @@ _NEGATED_RUN_SUFFIX_RE = re.compile(
 
 
 def _requests_run_checks(task: str) -> bool:
-    """Whether the user affirmatively asks to run checks.
-
-    The execute capability is sensitive to negation: matching the words
-    "run tests" inside "do not run tests" must never grant it. Evaluate each
-    matching phrase independently so a later affirmative clause can still
-    express permission after a negated one.
-    """
+    """Whether the user affirmatively asks to run checks."""
     for match in _RUN_CHECKS_RE.finditer(task or ""):
         prefix = task[:match.start()].strip()
-        # Only the current sentence/clause can negate this occurrence.
         prefix = re.split(r"[.!?;\n]|\b(?:but|however|instead)\b", prefix, flags=re.IGNORECASE)[-1]
-        # Keep interrupted negatives such as "do not, under any
-        # circumstances, run tests" intact for the bounded look-back above.
         prefix = re.sub(r"[^\w']+", " ", prefix).strip()
         if _NEGATED_RUN_PREFIX_RE.search(prefix):
             continue
@@ -296,22 +511,18 @@ def _requests_run_checks(task: str) -> bool:
         return True
     return False
 
+
 _MUTATION_RE = re.compile(
     r"\b(implement|fix|modify|update|refactor|rename|add|remove|delete|create|write|change)\b",
     re.IGNORECASE,
 )
 
-# Verbs that, used as an imperative, ask for a repository change.
 _ACTION_VERBS = (r"implement|fix|modify|update|refactor|rename|add|remove|delete|create|write|change"
                  r"|edit|rewrite|replace|patch")
-# "Make the changes you described", "apply those edits": delegated execution
-# of already-discussed changes. Bare "make" (make sure / make a list) is NOT
-# an action verb on its own.
 _DELEGATED_CHANGE = (r"(?:make|apply)\s+(?:all\s+)?(?:the|those|these|that|such|any)\s+"
                      r"(?:\w+\s+)?(?:changes?|edits?|modifications?|fix(?:es)?|updates?|corrections?|patch(?:es)?)\b")
 _ACTION_START_RE = re.compile(r"^(?:(?:" + _ACTION_VERBS + r")\b|" + _DELEGATED_CHANGE + r")", re.IGNORECASE)
 
-# Leading filler that does not change whether the sentence is a command.
 _FILLER_RE = re.compile(
     r"^(?:(?:ok(?:ay)?|now|then|also|next|so|and|first|finally|please|kindly|just|hey|hi|thanks)\b[\s,]*"
     r"|go\s+ahead\s+and\s+|(?:i|we)\s+(?:want|need|would\s+like|'d\s+like|expect)\s+you\s+to\s+"
@@ -319,12 +530,9 @@ _FILLER_RE = re.compile(
     r"|you\s+(?:should|must|need\s+to|have\s+to)\s+|let'?s\s+)",
     re.IGNORECASE,
 )
-# A leading scope phrase such as "In src/foo.py," / "According to X,".
 _LEAD_SCOPE_RE = re.compile(
     r"^(?:in|on|for|from|within|inside|at|according\s+to|based\s+on)\s+[^,;:?!\s]+(?:\s+[^,;:?!\s]+){0,8},\s*",
     re.IGNORECASE)
-# Sentences that open as a question, advice request or explanation request
-# are discussion of a change, never a command to perform one.
 _DISCUSSION_START_RE = re.compile(
     r"^(?:how|what|which|where|why|when|who|whom|whose|is|are|was|were|do|does|did|don'?t|not|never|"
     r"has|have|had|can|could|would|should|shall|will|may|might|"
@@ -334,8 +542,6 @@ _DISCUSSION_START_RE = re.compile(
 )
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;])\s+|\n+")
 _CLAUSE_SPLIT_RE = re.compile(r"\s*(?:,\s*then\b|\bthen\b|,?\s*and\s+then\b|,?\s+and\b)\s*", re.IGNORECASE)
-# Discussion sentences are only split on an explicit sequencing "then", never
-# on a bare "and" ("explain how to fix and update foo" stays discussion).
 _THEN_SPLIT_RE = re.compile(r"\s*(?:,\s*then\b|,?\s*and\s+then\b|\bthen\b)\s*", re.IGNORECASE)
 
 
@@ -352,27 +558,14 @@ def _strip_lead(clause: str) -> str:
 
 def is_mutation_request(task: str) -> bool:
     """Deterministic: does the user's text ASK THE AGENT to change the
-    repository (imperative/delegated action), as opposed to merely mentioning
-    or discussing a change (a how-to question, a request for advice or an
-    explanation, a question about past changes)?
-
-    Sentence by sentence, a sentence counts as a command only if - after
-    optional filler such as "please" / "can you" / "I want you to" and a
-    leading scope phrase - it starts with an action verb (or a delegation such
-    as "make the changes ..."). A sentence that opens as a question or
-    explanation/advice request is discussion regardless of verbs it contains
-    ("How do I fix ...", "What changes should I make ..."). Within a command
-    sentence, later coordinated clauses ("read foo.py and fix the bug") are
-    checked the same way; discussion sentences are never split.
-    """
+    repository (imperative/requested action), as opposed to merely mentioning
+    or discussing a change?"""
     for sentence in _SENTENCE_SPLIT_RE.split(task or ""):
         sentence = sentence.strip()
         if not sentence:
             continue
         head = _strip_lead(sentence)
         if _DISCUSSION_START_RE.search(head):
-            # Only a later, explicitly sequenced clause ("explain X, then
-            # fix Y") can still be a command.
             later = _THEN_SPLIT_RE.split(sentence)[1:]
             if any(_ACTION_START_RE.search(_strip_lead(c)) and not _DISCUSSION_START_RE.search(_strip_lead(c))
                    for c in later):
@@ -384,17 +577,6 @@ def is_mutation_request(task: str) -> bool:
     return False
 
 
-# Conservative markers for questions that are likely to need repository-wide
-# investigation rather than a single targeted read/investigation turn.
-#
-# "explain"-opened questions never reach this check in the first place -
-# _SIMPLE_OPEN_RE (below) does not list "explain" as a lookup opener, on the
-# principle that an explanation (a flow, a design) is not something a single
-# matched source line can BE. But "what"/"is"/"does" etc. ARE listed openers,
-# and a flow/pipeline/detailed-walkthrough question can just as easily start
-# with one of those ("What is the complete flow from input to output?"), so
-# this list also has to catch open-ended multi-step requests by their own
-# wording, independent of how they open.
 _SIMPLE_COMPLEX_RE = re.compile(
     r"\b(across|throughout|all|every|multiple|architecture|dependencies|dependency|"
     r"callers|callees|trace|tracing|compare|comparison|contrast|difference|differences|differ|"
@@ -433,98 +615,47 @@ def _requires_investigation(text: str) -> bool:
         or _MULTIPART_QUERY_RE.search(text)
         or len(_SENTENCE_SPLIT_RE.split(text)) > 1
     )
-# Open-ended purpose/overview questions have no single matching line, so a
-# keyword shortcut can only ever return an accidental match.
+
+
 _PURPOSE_RE = re.compile(
     r"\b(purpose|overview|summar(?:y|ize|ise)|about\s+(?:this|the)\s+(?:repo|repository|project)|"
     r"(?:use|uses|usage)\s+of\s+(?:this|the)\s+(?:repo|repository|project)|"
     r"what\s+(?:is|does)\s+(?:this|the)\s+(?:repo|repository|project)(?:\s+do)?)\b",
     re.IGNORECASE,
 )
-# "explain" is deliberately absent: it asks for an explanation (a flow, a
-# design), which a single matched source line cannot be.
-_SIMPLE_OPEN_RE = re.compile(
-    r"^(?:where|what|which|who|is|are|does|do|can|show|read)\b",
-    re.IGNORECASE,
-)
+
+
+def is_purpose_query(task: str) -> bool:
+    """Whether the request asks for a repository-level purpose or overview."""
+    return bool(_PURPOSE_RE.search(" ".join((task or "").split())))
+
+
 _SOURCE_QUESTION_WORDS = r"what|where|which|who|is|are|does|do|can|show|explain|how"
 _SOURCE_LEAD_IN_RE = re.compile(
-    r"^(?:(?:according\s+to|based\s+on|from|in)\s+(?:file\s+)?[\"']?[\w./\\-]+\.\w+[\"']?"
-    r"(?:\s*[,;:]\s*|\s+(?=(?:" + _SOURCE_QUESTION_WORDS + r")\b))"
-    r"|(?:(?:only|just)\s+)?(?:read|use|check|look\s+at)\s+(?:only\s+)?[\"']?[\w./\\-]+\.\w+[\"']?"
-    r"(?:\s*[,;:]\s*|\s+(?=(?:for\b|to\s+answer\b|and\s+answer\b|" + _SOURCE_QUESTION_WORDS + r")\b)))",
+    rf"^(?:(?:(?:only|just)\s+)?(?:read|use|check|look\s+at)\s+(?:only\s+|nothing\s+(?:but|other\s+than)\s+|no\s+(?:other\s+)?files?\s+(?:other\s+)?than\s+)?"
+    rf"|(?:nothing\s+(?:but|other\s+than)|no\s+(?:other\s+)?files?\s+(?:other\s+)?than)\s+"
+    rf"|(?:restrict|limit|confine|constrain)\w*\s+(?:yourself|reading|reads|search(?:es)?|investigation|analysis|scope|files?|sources?)\s+to\s+)"
+    rf"(?:the\s+)?(?:files?\s+)?(?:{_PATH_LIST})"
+    rf"(?:\s*[,;:]\s*|\s+(?=(?:for\b|to\s+answer\b|and\s+answer\b|{_SOURCE_QUESTION_WORDS})\b))",
     re.IGNORECASE,
 )
 
 
 def normalize_simple_question(task: str) -> str:
-    """Remove a recognized source restriction from the front of a query.
-
-    Source extraction/authorization remains owned by ``deterministic_floor``;
-    this helper only removes the already-recognized lead-in so downstream
-    simple retrieval ranks terms from the actual question rather than words
-    such as ``only read README.md``. Unrecognized prefixes are left unchanged.
-    """
+    """Remove a recognized explicit source restriction from the front of a query."""
     text = " ".join((task or "").split())
     if not text:
         return ""
     return _SOURCE_LEAD_IN_RE.sub("", text, count=1).strip()
-_SIMPLE_SOURCE_TASK_RE = re.compile(
-    r"^(?:(?:only|just)\s+(?:read|use|check|look\s+at)|"
-    r"(?:read|use|check|look\s+at)\s+only)\b",
-    re.IGNORECASE,
-)
 
 
-def looks_simple(task: str, floor: Optional[dict] = None) -> bool:
-    """Conservative deterministic check for a single, targeted, read-only task.
 
-    This helper exists only to decide whether the upfront planning LLM call can
-    be skipped.  It must never override a deterministic floor: explicit
-    mutation/verification wording always disables the shortcut.  The test is
-    intentionally narrow so normal or complex questions still take the
-    ordinary planning path.
-    """
-    text = " ".join((task or "").split())
-    floor = floor if floor is not None else deterministic_floor(text)
-    if not text:
-        return False
-    if floor.get("kind") == KIND_CHANGE or floor.get("rigor") == RIGOR_STRICT:
-        return False
-    if _MUTATION_RE.search(text) or _SERIOUS_RE.search(text):
-        return False
-    if _requires_investigation(text) or _PURPOSE_RE.search(text):
-        return False
-    question = normalize_simple_question(text)
-    if len(question.split()) > 16:
-        return False
-    source_task = bool(floor.get("sources")) and bool(_SIMPLE_SOURCE_TASK_RE.search(text))
-    if not _SIMPLE_OPEN_RE.search(question) and not source_task:
-        return False
-    # A direct file restriction is compatible with the shortcut because it
-    # narrows the permitted read; it does not justify widening investigation.
-    return True
-
-
-# A lookup is one short, single-sentence, read-only request. 20 words leaves
-# room for a natural question plus a file mention; anything longer is likely
-# multi-part and goes through the planner.
 _LOOKUP_MAX_WORDS = 20
 
 
 def is_lookup_task(task: str, floor: Optional[dict] = None) -> bool:
     """Route: may this task skip the planning LLM call and go straight to the
-    read tools (find_files -> get_file, or investigate_repository)?
-
-    Unlike `looks_simple` (which decides whether the no-LLM keyword shortcut
-    may answer, and so must match the question's exact shape), this does not
-    look at how the question is phrased - "In what languages is the README
-    available?" and "How many ..." are lookups just like "Where is X?". It
-    only asks what the task can NOT be: not a change, not a strict/verify/
-    audit request, not repository-wide in scope, not long or multi-part.
-    The model still chooses which read tool to call; this only decides
-    whether a plan and several criteria are drafted first.
-    """
+    read tools?"""
     text = " ".join((task or "").split())
     if not text:
         return False
@@ -534,7 +665,7 @@ def is_lookup_task(task: str, floor: Optional[dict] = None) -> bool:
     if floor.get("run_checks"):
         return False
     if (_MUTATION_RE.search(text) or _SERIOUS_RE.search(text)
-            or _requires_investigation(text) or _PURPOSE_RE.search(text)):
+            or _requires_investigation(text)):
         return False
     question = normalize_simple_question(text)
     if len(question.split()) > _LOOKUP_MAX_WORDS:
@@ -545,98 +676,37 @@ def is_lookup_task(task: str, floor: Optional[dict] = None) -> bool:
 
 
 def default_capabilities() -> dict:
-    """The safe default when no capability grant is present on state at all
-    (e.g. an old/hand-built state that predates this field) - read-only,
-    exactly like `default_intent()` defaults to the least assuming shape on
-    every other axis. Never used to grant WRITE; only ever to withhold it."""
+    """The safe default when no capability grant is present on state at all:
+    read-only."""
     return {"read": True, "write": False, "execute": False}
 
 
 def capabilities_for_floor(floor: dict) -> dict:
     """Runtime-safety capability grant for this invocation's execution
-    context, derived ONLY from `deterministic_floor(task)` - i.e. only from
-    the user's own original task text, matched by the same deterministic
-    `is_mutation_request` intent rule that forces `kind=KIND_CHANGE` (an
-    actual imperative change request - not a question/advice/explanation
-    that merely mentions a mutation word).
-
-    This is deliberately NOT derived from the resolved `Intent` returned by
-    `resolve_intent()`, because that also folds in whatever `kind` the
-    planning LLM call proposed (`model_intent`) - an untrusted, LLM-produced
-    value. If WRITE capability were read off the resolved intent, a planning
-    reply (or, further downstream, an LLM-generated delegation task) could
-    grant itself WRITE simply by claiming `"kind": "change"`. Computing it
-    here instead, once, before any LLM call, and only from `floor`, keeps
-    the grant a property of the execution context (what the user actually
-    asked for) rather than of anything the model later generates.
-
-    A `code_repository` (or other mutation-capable) delegation call is only
-    ever executed by the runtime when this invocation's capabilities allow
-    it - see deep_agent.py's `decide`. The Explorer's/Coder's/Debugger's own
-    tool selection, and the Main Agent's/Deep Agent's choice of WHICH tool
-    to call, are completely unaffected: this only answers whether a
-    requested WRITE-capable delegation may actually run.
-    """
+    context, derived ONLY from `deterministic_floor(task)`."""
     write = floor.get("kind") == KIND_CHANGE
-    # EXECUTE gates verify_repository: it runs the repository's configured
-    # command (e.g. the test suite), which can create or modify files in the
-    # checkout even though the LLM supplies no arguments. A change request
-    # implies it; a read-only request needs to ask for a run explicitly.
     return {"read": True, "write": write, "execute": write or bool(floor.get("run_checks"))}
 
 
-def delegation_allows(intent: dict, tool: str) -> bool:
-    """Return whether a Deep-Agent delegation is permitted by this invocation's
-    explicit source restriction.
-
-    An explicit sources list is a hard per-invocation read scope.  The only
-    repository capability that can safely honor it without granting additional
-    repository access is the direct get_file read.  The read-only Explorer,
-    Coder and verification delegations can otherwise inspect arbitrary paths,
-    so allowing them would bypass the restriction.
-    """
-    sources = intent.get("sources") or []
-    return not sources or tool == "get_file"
-
-
 def deterministic_floor(task: str) -> dict:
-    """Infer minimum intent requirements from the task text alone. Only
-    the keys that actually have a floor are present in the result:
-
-    - "answer_style_ceiling": the most detailed `answer_style` allowed
-      (STYLE_SHORT when the task asks for something short/brief/concise) -
-      a ceiling, not a minimum, because "short" is the tightest constraint
-      on this axis, not the loosest.
-    - "sources": the exact source list the task explicitly restricts work
-      to (authoritative - never widened by the model).
-    - "rigor": the minimum rigor (STANDARD or STRICT) required by
-      verification language and/or a clear mutation request.
-    - "kind": KIND_CHANGE when the task clearly asks to modify the
-      repository - authoritative (the model must not report a mutation
-      request as a mere "explain"/"check").
-
-    Deliberately does NOT infer a `depth` floor: depth is left to the planner
-    (and the default) rather than guessed from keywords.
-    """
+    """Infer minimum intent requirements from the task text alone."""
     text = task or ""
     floor: dict = {}
 
     if _SHORT_RE.search(text):
         floor["answer_style_ceiling"] = STYLE_SHORT
 
-    source_match = _SOURCE_RE.search(text)
-    if source_match:
-        raw_source = next((group for group in source_match.groups() if group), "")
-        normalized = normalize_source_path(raw_source)
-        if normalized:
-            floor["sources"] = [normalized]
+    hard_sources = extract_hard_sources(text)
+    if hard_sources:
+        floor["sources"] = hard_sources
+    scope = extract_scope(text, hard_sources)
+    if any(scope.values()):
+        floor["scope"] = scope
 
     rigor_floor = RIGOR_STRICT if _SERIOUS_RE.search(text) else None
 
     if is_mutation_request(text):
         floor["kind"] = KIND_CHANGE
-        # A mutation request must not stay "light" rigor, even if no
-        # verification language was also present.
         rigor_floor = _max_enum(rigor_floor, RIGOR_STANDARD, _RIGOR_ORDER)
 
     if rigor_floor is not None:
@@ -650,33 +720,40 @@ def deterministic_floor(task: str) -> dict:
 
 # -------------------------------------------------------------- resolution
 
+_PLANNER_SOURCE_RE = re.compile(
+    rf"\b(?:nothing\s+(?:but|other\s+than)|no\s+(?:other\s+)?files?\s+(?:other\s+)?than)\s+({_PATH_LIST})"
+    rf"|({_PATH_LIST})\s+only\s*(?:[.,;:!?]|$)",
+    re.IGNORECASE,
+)
+
+
+def _associated_sources(text: str) -> set:
+    found = list(extract_hard_sources(text))
+    for match in _PLANNER_SOURCE_RE.finditer(text or ""):
+        group = next((g for g in match.groups() if g), "")
+        found.extend(_clean_paths(_PATH_RE.findall(group)))
+    return set(found)
+
+
+def _model_sources_credible(task: str, sources: list) -> bool:
+    """A planner-proposed restriction is credible only if EVERY proposed path
+    is explicitly tied to a restriction phrase in the user's own text."""
+    if not sources:
+        return True
+    associated = _associated_sources(task or "")
+    return all(src in associated for src in sources)
+
 
 def resolve_intent(task: str, model_intent: Optional[dict] = None, *, floor: Optional[dict] = None) -> Intent:
     """Combine the deterministic floor with the (optional) planner-proposed
-    intent into the final Intent for this invocation.
-
-    `floor` should be `deterministic_floor(task)`, computed by the caller
-    BEFORE the planning LLM call (see deep_agent.py's `plan_task`) so that a
-    planner failure can never lose it - passing it in here (rather than
-    recomputing it) makes that ordering explicit, though recomputing it
-    would give the same result since the floor depends only on `task`.
-
-    The model may set any field freely and may raise depth/rigor above the
-    floor, but can never lower it: an explicit source restriction and a
-    mutation-implied "change" kind are authoritative and are never
-    overridden; rigor is raised to the floor if the model proposed less;
-    answer_style is capped at an explicit brevity ceiling if the model
-    proposed more.
-    """
+    intent into the final Intent for this invocation."""
     if floor is None:
         floor = deterministic_floor(task)
     base = default_intent()
     model = normalize_model_intent(model_intent) if model_intent else {}
 
     kind = floor.get("kind") or model.get("kind") or base["kind"]
-
     depth = model.get("depth", base["depth"])
-
     rigor = _max_enum(model.get("rigor", base["rigor"]), floor.get("rigor"), _RIGOR_ORDER)
 
     answer_style = model.get("answer_style", base["answer_style"])
@@ -687,27 +764,22 @@ def resolve_intent(task: str, model_intent: Optional[dict] = None, *, floor: Opt
     sources = floor.get("sources")
     if sources is None:
         sources = model.get("sources", base["sources"])
+        if not _model_sources_credible(task, sources):
+            sources = base["sources"]
 
-    return {"kind": kind, "depth": depth, "rigor": rigor, "answer_style": answer_style, "sources": list(sources)}
+    return {"kind": kind, "depth": depth, "rigor": rigor, "answer_style": answer_style,
+            "sources": list(sources), "scope": {**empty_scope(), **(floor.get("scope") or {})}}
 
 
 # --------------------------------------------------------------- planning bounds
 
-# PLANNED-step limits only (see the module docstring and deep_agent.py's
-# `plan_task`) - this says nothing about, and does not by itself bound,
-# actual Explorer/Coder tool calls or other downstream execution.
 _DEPTH_STEP_LIMIT = {DEPTH_MINIMAL: 1, DEPTH_STANDARD: 3}
-
-# Acceptance-criteria count limits from rigor (see evidence.py's MAX_CRITERIA
-# for the absolute ceiling, used here for RIGOR_STRICT).
 _RIGOR_CRITERIA_LIMIT = {RIGOR_LIGHT: 1, RIGOR_STANDARD: 3}
 
 
 def plan_step_limit(intent: Intent, configured_max: int) -> int:
     """Max PENDING steps the planning call's output is clamped to, from
-    `intent["depth"]`. DEPTH_DEEP uses the existing configured
-    `max_plan_steps` unchanged; DEPTH_MINIMAL/STANDARD use the smaller
-    fixed limits above (still never above `configured_max`)."""
+    `intent["depth"]`."""
     depth = intent.get("depth", DEPTH_STANDARD)
     if depth == DEPTH_DEEP:
         return max(1, configured_max)
@@ -715,32 +787,19 @@ def plan_step_limit(intent: Intent, configured_max: int) -> int:
     return max(1, min(configured_max, limit))
 
 
-# Bound actual delegate/get_file turns separately from planned steps.
-# Minimal-depth requests are capped; standard and deep requests keep the
-# configured budget. Leave room for an initial failed or insufficient read
-# and a follow-up investigation.
 _DEPTH_AGENT_STEP_LIMIT = {DEPTH_MINIMAL: 4}
 
 
 def agent_step_budget(intent: Intent, configured_max: int) -> int:
     """Max actual tool-using `decide` turns (`step_count`) this invocation
-    may spend, from `intent["depth"]`. Only DEPTH_MINIMAL is clamped; every
-    other depth (including an intent with no explicit depth at all) keeps
-    `configured_max`, exactly as before this function existed."""
+    may spend, from `intent["depth"]`."""
     if intent.get("depth") == DEPTH_MINIMAL:
         return max(1, min(configured_max, _DEPTH_AGENT_STEP_LIMIT[DEPTH_MINIMAL]))
     return max(1, configured_max)
 
 
 def criteria_limit(intent: Intent, configured_max: int) -> int:
-    """Max acceptance criteria, from `intent["rigor"]`. RIGOR_STRICT uses
-    the existing configured max (`evidence.MAX_CRITERIA`) unchanged.
-
-    A request whose `kind` is
-    KIND_CHANGE is never clamped below the RIGOR_STANDARD limit, even if
-    rigor somehow ended up RIGOR_LIGHT - a mutation/change task must not be
-    accidentally reduced to a minimal, read-only-shaped criteria set.
-    """
+    """Max acceptance criteria, from `intent["rigor"]`."""
     rigor = intent.get("rigor", RIGOR_STANDARD)
     if rigor == RIGOR_STRICT:
         limit = configured_max

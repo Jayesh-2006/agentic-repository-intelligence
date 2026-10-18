@@ -1,29 +1,27 @@
-"""Structured plan state and transitions for Deep Agent invocations.
+"""Structured plan state and transitions for Main Agent invocations.
 
-Plans hold pending and attempted steps in execution order. Revisions replace
-only pending work, and a monotonic sequence keeps step identifiers unique
-within the invocation. Helpers return updated plan dictionaries rather than
-mutating existing state.
+Plans hold pending and attempted steps in execution order. Plan steps describe
+goals rather than mandatory tool names; direct repository tool calls bind to
+compatible pending steps based on intent and domain/target overlap rather than
+tool-name matching. Revisions replace only pending work, and a monotonic
+sequence keeps step identifiers unique within the invocation.
 """
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Optional
 
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
+
+from .json_utils import parse_json_object
 
 PENDING = "pending"
 IN_PROGRESS = "in_progress"
 COMPLETED = "completed"
 FAILED = "failed"
+SKIPPED = "skipped"
 
-# The Deep Agent's overall task-level outcome (deep_agent.decide),
-# distinct from safety.py's per-code_repository-run terminal states
-# (SUCCESS/NO_TESTS/UNAVAILABLE/FAILED/TIMEOUT/REPAIR_LIMIT_REACHED). One of
-# these describes the whole invocation; safety.py's states describe a single
-# delegated verification/repair cycle.
 OUTCOME_SUCCESS = "SUCCESS"
 OUTCOME_FAILED = "FAILED"
 OUTCOME_INCOMPLETE = "INCOMPLETE"
@@ -32,20 +30,14 @@ OUTCOME_INCOMPLETE = "INCOMPLETE"
 class PlanStep(TypedDict):
     step_id: str
     description: str
-    status: str  # PENDING | IN_PROGRESS | COMPLETED | FAILED
+    status: str  # PENDING | IN_PROGRESS | COMPLETED | FAILED | SKIPPED
+    resolution_reason: NotRequired[str]
 
 
 class Plan(TypedDict):
     objective: str
     steps: list[PlanStep]
-    # The step currently IN_PROGRESS, or None once every step recorded so
-    # far has been closed out (completed/failed) and `decide` has not yet
-    # started a new one.
     current_step_id: Optional[str]
-    # Monotonic counter used to generate step_ids. Kept on the Plan itself
-    # (rather than derived from len(steps)) because revise_pending_steps can
-    # remove PENDING entries, which would otherwise let a freshly generated
-    # id collide with one already used by an earlier, still-remembered step.
     step_seq: int
 
 
@@ -60,13 +52,7 @@ def _new_step_id(plan: Plan) -> tuple[str, int]:
 
 
 def seed_pending_steps(plan: Plan, descriptions: list[str]) -> Plan:
-    """Give a plan its initial (or additional) PENDING steps, in order.
-
-    Used once per invocation by deep_agent.py's `plan_task` node, from an
-    LLM-authored list of step descriptions - see parse_plan_steps. Does not
-    touch `current_step_id`: seeding a plan with pending work never starts
-    any of it.
-    """
+    """Give a plan its initial (or additional) PENDING steps, in order."""
     steps = list(plan["steps"])
     seq = plan.get("step_seq", 0)
     for description in descriptions:
@@ -81,109 +67,163 @@ def seed_pending_steps(plan: Plan, descriptions: list[str]) -> Plan:
 
 
 _WORD_RE = re.compile(r"[a-z0-9_]+")
+_SUBTOKEN_RE = re.compile(r"[a-z0-9]+")
 _MATCH_MIN_OVERLAP = 0.6
+
+_TOOL_PREFIXES = (
+    "search_repository", "find_files", "find_symbol", "get_file", "get_symbol",
+    "find_callers", "find_callees", "find_importers", "get_dependencies", "get_ast",
+    "write_file", "verify_repository", "run_command", "revise_plan",
+)
+_GENERIC_STEP_WORDS = frozenset({
+    "the", "a", "an", "in", "on", "of", "to", "for", "from", "with", "by", "and", "or",
+    "use", "using", "call", "tool", "repository", "repo", "codebase", "file", "files",
+    "symbol", "symbols", "function", "functions", "method", "methods", "class", "classes",
+    "module", "modules", "search", "find", "get", "read", "inspect", "locate", "trace",
+    "check", "investigate", "explore", "identify", "determine", "understand", "explain",
+    "how", "what", "where", "which", "who", "when", "why", "py", "md", "src",
+})
+_MUTATION_STEP_RE = re.compile(
+    r"\b(?:write|modify|edit|update|fix|implement|patch|create|add|remove|delete|replace|refactor|write_file)\b",
+    re.IGNORECASE,
+)
+_VERIFY_STEP_RE = re.compile(
+    r"\b(?:verify|test|tests|run_command|verify_repository|pytest|syntax|validate|validation)\b",
+    re.IGNORECASE,
+)
 
 
 def _normalize(text: str) -> str:
     return " ".join(_WORD_RE.findall(text.lower()))
 
 
-_MATCH_FILLER = {"the", "a", "an", "of", "in", "on", "to", "for", "and", "or", "each", "any", "all",
-                 "file", "files", "repository", "return", "list", "find", "open", "with", "from", "that",
-                 "is", "are", "be", "by", "as", "it", "its", "their", "e", "g"}
+def _strip_tool_names(text: str) -> str:
+    lowered = text.lower()
+    for t_name in _TOOL_PREFIXES:
+        lowered = re.sub(rf"\b{re.escape(t_name)}\b\s*:?", " ", lowered)
+    return " ".join(_WORD_RE.findall(lowered))
+
+
+def _meaningful_subtokens(text: str) -> set[str]:
+    stripped = _strip_tool_names(text)
+    tokens: set[str] = set()
+    for word in _WORD_RE.findall(stripped):
+        if word not in _GENERIC_STEP_WORDS and len(word) > 1:
+            tokens.add(word)
+        for sub in _SUBTOKEN_RE.findall(word.replace("_", " ")):
+            if sub not in _GENERIC_STEP_WORDS and len(sub) > 1:
+                tokens.add(sub)
+    return tokens
 
 
 def fallback_step_description(objective: str) -> str:
-    """The exact wording `plan_task` (deep_agent.py) uses to seed a plan
-    with one generic PENDING step when no real multi-step plan exists yet -
-    either the planning call failed/returned nothing parseable, or the task
-    was routed as a lookup and skipped planning entirely (the common case
-    for a short, single-fact question). Exposed here, rather than inlined at
-    the call site, so `_match_pending_index` can recognise this specific
-    template by exact text and not merely by "it happens to be the only
-    PENDING step" (see the comment there for why that distinction matters).
-    """
+    """The wording `plan_task` uses to seed a plan with one generic PENDING step."""
     return f"Investigate and address the objective: {objective}"
 
 
-def _match_pending_index(steps: list, description: str, objective: Optional[str] = None) -> Optional[int]:
-    """Index of the PENDING step that `description` most plausibly refers
-    to, or None. Tried in order: the single-step fallback-template special
-    case below; exact match after normalisation (case, whitespace,
-    punctuation); one normalised text containing the other (the model
-    usually shortens or extends a planned step's wording); then the best
-    word-overlap (Jaccard) at or above _MATCH_MIN_OVERLAP. Ties go to the
-    earliest step. None when nothing is close enough, in which case the
-    caller records an ad-hoc step instead."""
-    needle = _normalize(description)
+def _step_kind_compatible(step_desc: str, tool_name: str) -> bool:
+    """Prevent a read-only tool call from consuming a mutation/verification step,
+    or a mutation call from consuming a pure verification step."""
+    if not tool_name:
+        return True
+    is_write_step = bool(_MUTATION_STEP_RE.search(step_desc))
+    is_verify_step = bool(_VERIFY_STEP_RE.search(step_desc)) and not is_write_step
+    if tool_name == "write_file":
+        return is_write_step or not is_verify_step
+    if tool in ("verify_repository", "run_command") if (tool := tool_name) else False:
+        return is_verify_step or is_write_step
+    if is_write_step or is_verify_step:
+        return False
+    return True
+
+
+def _match_pending_index(
+    steps: list,
+    description: str,
+    objective: Optional[str] = None,
+    tool_name: str = "",
+) -> Optional[int]:
+    """Index of the PENDING step that `description` refers to, decoupled from tool names.
+
+    Tries in order:
+      1. The single-step fallback-template special case.
+      2. Exact match after stripping tool-name prefixes.
+      3. Containment after stripping tool-name prefixes (unique match).
+      4. Word/subtoken overlap against compatible pending steps.
+      5. When there is only one compatible pending investigation step and it
+         shares at least one meaningful domain token with `description`, bind to
+         it so direct tool calls advance planned investigation steps instead of
+         leaving them permanently pending.
+    """
+    needle = _strip_tool_names(description) or _normalize(description)
     if not needle:
         return None
-    pending = [(i, _normalize(s["description"])) for i, s in enumerate(steps) if s["status"] == PENDING]
+    if not tool_name and ":" in description:
+        prefix = description.split(":", 1)[0].strip().lower()
+        if prefix in _TOOL_PREFIXES:
+            tool_name = prefix
+
+    pending = [
+        (i, _strip_tool_names(s["description"]) or _normalize(s["description"]), s["description"])
+        for i, s in enumerate(steps)
+        if s["status"] == PENDING and _step_kind_compatible(s["description"], tool_name)
+    ]
+    if not pending:
+        return None
+
     if objective is not None and len(pending) == 1:
-        i, _ = pending[0]
-        if steps[i]["description"] == fallback_step_description(objective):
-            # This step does not describe independent work a delegation
-            # could legitimately fail to match - it is a placeholder for
-            # "whatever the agent investigates first", seeded because there
-            # was no real plan. Wording-based matching below routinely fails
-            # to link it to the model's own, differently (often much more
-            # narrowly) phrased delegation query - especially for short
-            # single-fact lookups, where the task may contribute only one or
-            # two content words - which orphaned it as permanently PENDING
-            # even on a fully successful run: a false "planned step not
-            # attempted" note on an otherwise correct answer. Since it is
-            # both the only pending step and provably this exact
-            # placeholder, the next delegation is understood to be
-            # attempting it, whatever words it uses.
+        i, _, raw_desc = pending[0]
+        if raw_desc == fallback_step_description(objective):
             return i
-    for i, text in pending:
-        if text == needle:
-            return i
-    for i, text in pending:
-        if text and (needle in text or text in needle):
-            return i
+
+    exact = [i for i, text, _ in pending if text == needle]
+    if exact:
+        return exact[0] if len(exact) == 1 else None
+
+    contained = [i for i, text, _ in pending if text and (needle in text or text in needle)]
+    if contained:
+        return contained[0] if len(contained) == 1 else None
+
     needle_words = set(needle.split())
-    best_index, best_score = None, 0.0
-    for i, text in pending:
+    scored = []
+    for i, text, _ in pending:
         words = set(text.split())
-        if not words:
-            continue
-        score = len(words & needle_words) / len(words | needle_words)
-        if score > best_score:
-            best_index, best_score = i, score
-    if best_index is not None and best_score >= _MATCH_MIN_OVERLAP:
-        return best_index
-    # Jaccard punishes a long delegated query that merely restates a short planned
-    # step, leaving the planned step PENDING forever (=> PARTIAL). Fall back to the
-    # overlap coefficient over content words.
-    needle_c = needle_words - _MATCH_FILLER
-    best_index, best_score = None, 0.0
-    for i, text in pending:
-        words = set(text.split()) - _MATCH_FILLER
-        shared = words & needle_c
-        if len(shared) < 3 or not words:
-            continue
-        score = len(shared) / min(len(words), len(needle_c))
-        if score > best_score:
-            best_index, best_score = i, score
-    return best_index if best_score >= 0.6 else None
+        if words:
+            score = len(words & needle_words) / len(words | needle_words)
+            if score >= _MATCH_MIN_OVERLAP:
+                scored.append((score, i))
+    scored.sort(reverse=True)
+    if scored and (len(scored) == 1 or scored[0][0] > scored[1][0]):
+        return scored[0][1]
+
+    needle_tokens = _meaningful_subtokens(description)
+    if needle_tokens:
+        token_scored = []
+        for i, _, raw_desc in pending:
+            step_tokens = _meaningful_subtokens(raw_desc)
+            if not step_tokens:
+                continue
+            shared = len(needle_tokens & step_tokens)
+            if shared > 0:
+                coverage = shared / min(len(needle_tokens), len(step_tokens))
+                jaccard = shared / len(needle_tokens | step_tokens)
+                token_scored.append((coverage, jaccard, shared, -i, i))
+        token_scored.sort(reverse=True)
+        if token_scored:
+            best = token_scored[0]
+            if best[0] >= 0.5 or best[2] >= 2 or len(pending) == 1:
+                if len(token_scored) == 1 or (best[0], best[1], best[2]) > (
+                    token_scored[1][0], token_scored[1][1], token_scored[1][2]
+                ):
+                    return best[4]
+
+    return None
 
 
-def start_step(plan: Plan, description: str) -> Plan:
-    """Record that the Deep Agent is now attempting `description` (the
-    delegation call `decide` is about to make).
-
-    If `description` matches an existing PENDING step (tolerantly - see
-    `_match_pending_index`: the Deep Agent will not reproduce a planned
-    step's wording byte-for-byte), that step is promoted to IN_PROGRESS and
-    becomes the current step: this is genuine step *selection* against the
-    plan, not a blind append. Otherwise a brand-new IN_PROGRESS step is
-    appended - the Deep Agent
-    going off-plan (new evidence made a different action necessary) is
-    still recorded as real, honest history, not silently dropped.
-    """
+def start_step_for_call(plan: Plan, description: str, tool_name: str = "") -> tuple[Plan, str]:
+    """Start a planned or ad-hoc step for one tool call and return `(updated_plan, step_id)`."""
     steps = list(plan["steps"])
-    match_index = _match_pending_index(steps, description, plan.get("objective"))
+    match_index = _match_pending_index(steps, description, plan.get("objective"), tool_name=tool_name)
     seq = plan.get("step_seq", 0)
     if match_index is not None:
         current_id = steps[match_index]["step_id"]
@@ -191,34 +231,53 @@ def start_step(plan: Plan, description: str) -> Plan:
     else:
         current_id, seq = _new_step_id(plan)
         steps.append({"step_id": current_id, "description": description, "status": IN_PROGRESS})
-    return {"objective": plan["objective"], "steps": steps, "current_step_id": current_id, "step_seq": seq}
+    updated: Plan = {
+        "objective": plan["objective"],
+        "steps": steps,
+        "current_step_id": current_id,
+        "step_seq": seq,
+    }
+    return updated, current_id
 
 
-def finish_current_step(plan: Plan, succeeded: bool) -> Plan:
-    """Record the result of the current step: COMPLETED if the delegation it
-    represents succeeded, FAILED otherwise. A no-op (returns `plan`
-    unchanged) if there is no current step - defensive only; `update_state`
-    never calls this without one having just been started by `decide`."""
-    current_id = plan.get("current_step_id")
-    if current_id is None:
+def start_step(plan: Plan, description: str) -> Plan:
+    """Record that the Main Agent is now attempting `description`."""
+    updated, _ = start_step_for_call(plan, description)
+    return updated
+
+
+def finish_step(plan: Plan, step_id: Optional[str], succeeded: bool, reason: Optional[str] = None) -> Plan:
+    """Record the outcome (`COMPLETED` or `FAILED`) of `step_id`."""
+    target_id = step_id or plan.get("current_step_id")
+    if target_id is None:
         return plan
     status = COMPLETED if succeeded else FAILED
-    steps = [dict(s, status=status) if s["step_id"] == current_id else s for s in plan["steps"]]
+    extra = {"resolution_reason": reason} if reason and not succeeded else {}
+    steps = [dict(s, status=status, **extra) if s["step_id"] == target_id else s for s in plan["steps"]]
+    next_in_progress = next(
+        (s["step_id"] for s in steps if s.get("status") == IN_PROGRESS),
+        None,
+    )
     return {
         "objective": plan["objective"],
         "steps": steps,  # type: ignore[arg-type]
-        "current_step_id": None,
+        "current_step_id": None if plan.get("current_step_id") == target_id else next_in_progress,
         "step_seq": plan.get("step_seq", 0),
     }
 
 
-def revise_pending_steps(plan: Plan, descriptions: list[str]) -> Plan:
-    """Replace the plan's remaining (PENDING) work with a new list of step
-    descriptions, in order - the effect of the Deep Agent's `revise_plan`
-    tool (deep_agent.py). Steps that are already IN_PROGRESS, COMPLETED or
-    FAILED are recorded facts and are never touched or removed.
-    """
-    kept = [s for s in plan["steps"] if s["status"] != PENDING]
+def finish_current_step(plan: Plan, succeeded: bool, reason: Optional[str] = None) -> Plan:
+    """Record the result of `plan['current_step_id']`."""
+    return finish_step(plan, plan.get("current_step_id"), succeeded, reason=reason)
+
+
+def revise_pending_steps(plan: Plan, descriptions: list[str], *, reason: str = "Plan revised") -> Plan:
+    """Resolve remaining PENDING work as skipped, then append the revised step list."""
+    kept = [
+        dict(s, status=SKIPPED, resolution_reason=reason)
+        if s["status"] == PENDING else s
+        for s in plan["steps"]
+    ]
     seq = plan.get("step_seq", 0)
     steps = list(kept)
     for description in descriptions:
@@ -239,27 +298,20 @@ def pending_steps(plan: Optional[Plan]) -> list[PlanStep]:
     return [s for s in plan["steps"] if s["status"] == PENDING]
 
 
-def is_complete(plan: Optional[Plan]) -> bool:
-    """Whether every step recorded so far ended COMPLETED - false for an
-    empty plan (nothing attempted yet) as well as for one with any
-    PENDING/IN_PROGRESS/FAILED step."""
-    return bool(plan) and bool(plan["steps"]) and all(s["status"] == COMPLETED for s in plan["steps"])
+def is_readonly_step_description(description: str) -> bool:
+    """True when a step description represents read-only investigation rather
+    than a code modification or command execution."""
+    text = str(description or "")
+    return not (_MUTATION_STEP_RE.search(text) or _VERIFY_STEP_RE.search(text))
 
 
 def describe_step(step: PlanStep) -> str:
-    """One-line trace description of a single step, e.g. for the console
-    trace (see agent/utils.describe_update)."""
+    """One-line trace description of a single step."""
     return f"{step['step_id']} ({step['status']}): {step['description']}"
 
 
 def describe_plan(plan: Optional[Plan]) -> str:
-    """A short plan-status digest, injected as an extra message into
-    `decide`'s LLM call (deep_agent.py) so step selection is genuinely
-    informed by what is left to do and what has already happened, instead
-    of the model only ever seeing raw tool-result text. Returns "" when
-    there is nothing to say (no plan yet, or a plan with no steps at all -
-    e.g. `plan_task` could not produce anything and the Deep Agent has not
-    delegated yet either)."""
+    """A short plan-status digest injected into `decide`'s LLM call."""
     if not plan or not plan["steps"]:
         return ""
     lines = ["Plan status for this task:"]
@@ -267,39 +319,25 @@ def describe_plan(plan: Optional[Plan]) -> str:
     if pending:
         lines.append("Not yet attempted:")
         lines.extend(f"  - {s['description']}" for s in pending)
-    attempted = [s for s in plan["steps"] if s["status"] != PENDING]
+    skipped = [s for s in plan["steps"] if s["status"] == SKIPPED]
+    if skipped:
+        lines.append("Dropped as unnecessary or superseded:")
+        lines.extend(f"  - {s['description']} ({s.get('resolution_reason', 'no longer needed')})" for s in skipped)
+    attempted = [s for s in plan["steps"] if s["status"] in (IN_PROGRESS, COMPLETED, FAILED)]
     if attempted:
         lines.append("Already attempted:")
         lines.extend(f"  - {describe_step(s)}" for s in attempted)
     lines.append(
-        "You do not have to follow the listed order - pursue whichever step best fits the evidence "
-        "gathered so far. Use revise_plan if the plan needs to change. Steps left untouched keep the "
-        "completion check at PARTIAL, so drop any you will not do."
+        "Pursue whichever repository tool call(s) best establish the unmet acceptance criteria. "
+        "Use revise_plan if the remaining steps need to change."
     )
     return "\n".join(lines)
 
 
-_CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", flags=re.MULTILINE)
-
-
 def parse_plan_steps(text: str, max_steps: int) -> list[str]:
-    """Parse an LLM planning reply (deep_agent.py's `plan_task` node) into a
-    list of plain step descriptions.
-
-    Accepts a JSON array of strings, or of objects with a "description"/
-    "step"/"title" field (some models wrap steps in objects despite being
-    asked for plain strings). Also accepts the planning call's
-    object form {"steps": [...], "criteria": [...]} and reads only "steps"
-    here (evidence.parse_criteria reads the criteria from the same reply).
-    Tolerates surrounding markdown code fences.
-    Returns [] (never raises) when nothing usable could be parsed - the
-    caller decides what generic fallback to use, so this module never has
-    to hard-code a plan for any particular kind of task.
-    """
-    cleaned = _CODE_FENCE_RE.sub("", text.strip()).strip()
-    try:
-        data = json.loads(cleaned)
-    except (TypeError, ValueError):
+    """Parse an LLM planning reply into a list of plain step descriptions."""
+    data = parse_json_object(text)
+    if data is None:
         return []
     if isinstance(data, dict):
         data = data.get("steps")
@@ -316,20 +354,6 @@ def parse_plan_steps(text: str, max_steps: int) -> list[str]:
     return steps[: max(1, max_steps)]
 
 
-def parse_objective_verdict(text: str) -> bool:
-    """Parse the objective-check reply (deep_agent.py's `_objective_satisfied`)
-    into a strict yes/no. Expects a JSON object with a boolean "satisfied"
-    field (tolerating code fences). Anything else - unparseable text, a
-    missing field, a non-boolean value - is False: the objective is only
-    treated as satisfied on an explicit, well-formed affirmative."""
-    cleaned = _CODE_FENCE_RE.sub("", (text or "").strip()).strip()
-    try:
-        data = json.loads(cleaned)
-    except (TypeError, ValueError):
-        return False
-    return isinstance(data, dict) and data.get("satisfied") is True
-
-
 def classify_outcome(
     plan: Optional[Plan],
     failure_info: Optional[dict],
@@ -338,28 +362,7 @@ def classify_outcome(
     objective_satisfied: bool = False,
     verification_info: Optional[dict] = None,
 ) -> str:
-    """The Deep Agent's task-level outcome for this invocation, computed
-    from objective signals rather than trusted from the model's own final
-    answer text (see the module docstring and deep_agent.py's `decide`):
-
-    - FAILED: the most recent code_repository/verify_repository delegation
-      has an explicit failing result (`failure_info` is not None - the same
-      field update_state clears to None on later success). An unavailable
-      verification result is checked first and remains INCOMPLETE even if a
-      repair wrapper also reports that its attempt limit was reached.
-    - INCOMPLETE: the model stopped delegating while planned work was still
-      PENDING and unaddressed (it never called revise_plan to say that work
-      was no longer needed), OR the objective itself has not been shown to
-      be satisfied (see below). Consuming the final allowed step alone does
-      not make a task incomplete when the final evidence check confirms it.
-    - SUCCESS: only when, in addition to no outstanding failure and no
-      untouched planned work, there is objective-level evidence: at least
-      one delegated report was actually observed (`has_evidence`), and the
-      objective check against those reports/verification results
-      (`objective_satisfied`, from deep_agent.py) confirmed the user's
-      objective is met. Completed plan steps, a Coder reporting success, or
-      the model producing a final answer are not sufficient on their own.
-    """
+    """The Main Agent's task-level outcome for this invocation."""
     if verification_info and (verification_info.get("status") == "unavailable"
                               or verification_info.get("state") == "UNAVAILABLE"):
         return OUTCOME_INCOMPLETE

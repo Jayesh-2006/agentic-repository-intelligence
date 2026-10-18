@@ -3,20 +3,21 @@ The agent-facing repository tools.
 
 Each tool is a plain function that delegates to one RepoService method and
 returns a JSON-serialisable dict (or {"error": {...}}). The docstrings are
-written for the future agent: they are what an LLM will read to decide which
-tool to call, so they say what the tool is for and what comes back.
+written for the LLM agent: they describe what each tool is for and what it
+returns.
 
     tools = make_tools(service)
     tools["find_symbol"]("Entity.save")
 
-make_tools() returns a dict {tool name: function}, which is the shape a
-LangGraph / LangChain tool node can consume. write_file is only
-wired into the Coder's tool list (agent/tools.py build_coder_tools) - the
-Explorer and the Main Agent's direct tool set stay read-only.
+make_tools() returns a dict {tool name: function} for the ten read-only
+repository tools plus write_file. make_verification_tools() returns
+run_command. Capability gating and transactional safeguards are enforced by
+the agent orchestration layer around these tools.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable
 
 from .service import RepoService
@@ -91,18 +92,28 @@ def make_tools(service: RepoService) -> dict[str, Callable[..., dict]]:
 
 
 def make_verification_tools(service: RepoService) -> dict[str, Callable[..., dict]]:
-    """The verification-capability tool (run_command).
-
-    Kept separate from make_tools() so the existing read/write tool registry
-    (eleven read/write functions) is unchanged; only the Debugger's tool list
-    (agent/tools.py build_debugger_tools) includes this.
-    """
+    """The command-execution tool (run_command), kept separate from make_tools()
+    so the eleven read/write functions in make_tools() remain unchanged."""
 
     def run_command(command: str, timeout: int = 60) -> dict:
         """Run a command with the repository root as its working directory (no
         way to point it elsewhere), to check whether an implementation works
         (e.g. running a test suite). Returns stdout, stderr and the exit code;
         a command that runs too long is killed and reported as timed out."""
+        from .agent.safety import get_active_execution_scope, validate_command_safety
+
+        scope = get_active_execution_scope()
+        write_allowed = bool(scope.write_allowed) if scope is not None else False
+        repo_root = (
+            Path(service.index.root).resolve()
+            if getattr(service, "index", None) is not None and getattr(service.index, "root", None)
+            else None
+        )
+        safety_err = validate_command_safety(
+            command, write_allowed=write_allowed, repo_root=repo_root
+        )
+        if safety_err is not None:
+            return safety_err
         return service.run_command(command, timeout)
 
     return {"run_command": run_command}

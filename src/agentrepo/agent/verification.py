@@ -1,40 +1,68 @@
-"""The verification step of the Coder -> Verification -> Debugger
-repair loop (see delegation.py).
+"""Deterministic verification helpers for repository changes and test execution.
 
-Verification is deliberately NOT an LLM call: it deterministically runs a
-configured command (RepoService.run_command, always inside the repository
-root) and reports pass/fail from its exit code. This mirrors the existing
-step-count logic in explorer.py/coder.py/debugger.py, which is also plain
-Python control flow rather than something the LLM decides.
+Verification is plain Python control flow (not an LLM call): it deterministically
+validates and runs a configured command or scoped syntax check (`RepoService.run_command`,
+always inside the repository root) and classifies pass/fail from its exit code.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 import sys
 
 from ..service import RepoService
 from .config import AgentConfig
 
 
-def run_verification(service: RepoService, config: AgentConfig) -> dict:
-    """Run config.verification_command and classify the outcome.
+def run_verification(
+    service: RepoService,
+    config: AgentConfig,
+    *,
+    write_allowed: bool = False,
+) -> dict:
+    """Validate and run `config.verification_command` and classify the outcome.
 
-    Returns a dict with the raw run_command() result (command, exit_code,
-    stdout, stderr, timed_out - or `error` if the command could not even be
-    started) plus:
-      - `status`: "passed" | "no_tests" | "failed" | "timeout" | "unavailable"
-      - `passed`: True when nothing needs to be sent to the Debugger repair
-        loop - not only a literal exit-0 pass, but also "no_tests" (there is
-        nothing to verify) and "unavailable" (the verification setup itself
-        is broken, e.g. a missing executable). Neither of those is evidence
-        that the Coder's/Debugger's *code change* is wrong, so the repair
-        loop must not burn an attempt chasing a bug that doesn't exist.
+    Returns a dict with the raw `run_command()` result (`command`, `exit_code`,
+    `stdout`, `stderr`, `timed_out` - or `error` if the command was blocked by
+    safety policy or could not be started) plus:
+      - `status`: "passed" | "not_configured" | "failed" | "timeout" | "unavailable" | "blocked"
+      - `passed`: True when nothing needs repair - not only a literal exit-0
+        pass, but also "not_configured" (there is no configured command to run)
+        and "unavailable" (the verification setup itself is broken, e.g. a
+        missing executable). A command blocked by `validate_command_safety` is
+        reported with `passed=False, status="blocked"` and its `error` dict.
     """
-    if not config.verification_command.strip():
-        return {"passed": True, "status": "not_configured", "command": "(no command configured)",
-                "exit_code": None, "timed_out": False, "stdout": "", "stderr": ""}
+    cmd = config.verification_command.strip()
+    if not cmd:
+        return {
+            "passed": True,
+            "status": "not_configured",
+            "command": "(no command configured)",
+            "exit_code": None,
+            "timed_out": False,
+            "stdout": "",
+            "stderr": "",
+        }
 
-    result = service.run_command(config.verification_command, timeout=config.command_timeout_seconds)
+    from .safety import validate_command_safety
+
+    repo_root = Path(service.index.root).resolve() if getattr(service, "index", None) else None
+    safety_err = validate_command_safety(
+        cmd, write_allowed=write_allowed, repo_root=repo_root
+    )
+    if safety_err is not None:
+        return {
+            "passed": False,
+            "status": "blocked",
+            "command": cmd,
+            "exit_code": None,
+            "timed_out": False,
+            "stdout": "",
+            "stderr": safety_err["error"].get("message", ""),
+            **safety_err,
+        }
+
+    result = service.run_command(cmd, timeout=config.command_timeout_seconds)
 
     if "error" in result:
         return {"passed": True, "status": "unavailable", **result}
@@ -45,32 +73,43 @@ def run_verification(service: RepoService, config: AgentConfig) -> dict:
     return {"passed": False, "status": "failed", **result}
 
 
-def run_scoped_verification(service: RepoService, config: AgentConfig, changed_files: list[str]) -> dict:
-    """Lightweight, change-scoped safety check for `code_repository` (see
-    delegation.py): confirm the Python files the Coder/Debugger actually
-    touched this run still parse, without running the repository's full
-    `config.verification_command` for every small edit. `verify_repository` remains the way to
-    run that full command explicitly when broader confidence is wanted.
+def run_scoped_verification(
+    service: RepoService, config: AgentConfig, changed_files: list[str]
+) -> dict:
+    """Lightweight, change-scoped safety check for `write_file`: confirm the
+    Python files touched in the current transaction still parse, without running
+    the repository's full `config.verification_command` for every edit.
+    `verify_repository` remains the way to run that full command explicitly.
 
-    `py_compile` only checks syntax, not whether the change is *correct* -
-    that is a deliberate, minimal safety net, not a replacement for the full
-    verification command. Returns the same result shape as run_verification
-    (status/passed/command/exit_code/stdout/stderr) so terminal_state(),
-    verification_summary() and verification_signature() all keep working
-    unchanged for either.
+    `py_compile` checks syntax only and runs with `-I` (isolated mode) so
+    repository files such as `py_compile.py` or `sitecustomize.py` in `cwd` are
+    never imported during syntax verification. Returns the same result shape as
+    `run_verification` (`status`/`passed`/`command`/`exit_code`/`stdout`/`stderr`)
+    so `terminal_state()`, `verification_summary()`, and `verification_signature()`
+    work unchanged for either.
     """
-    py_files = sorted({f for f in changed_files if f.casefold().endswith(".py")})
+    root = Path(service.index.root).resolve() if getattr(service, "index", None) else None
+    py_files = sorted(
+        {
+            f
+            for f in changed_files
+            if isinstance(f, str)
+            and f.casefold().endswith(".py")
+            and (root is None or (root / f).is_file())
+        }
+    )
     if not py_files:
-        # Nothing Python-shaped changed (e.g. only a README was touched) -
-        # there is nothing for a syntax check to catch, so this is a pass,
-        # not a skip: there are no changed Python files to validate.
         return {
-            "passed": True, "status": "no_changes",
+            "passed": True,
+            "status": "no_changes",
             "command": "(no changed Python files to check)",
-            "exit_code": None, "timed_out": False, "stdout": "", "stderr": "",
+            "exit_code": None,
+            "timed_out": False,
+            "stdout": "",
+            "stderr": "",
         }
 
-    command = [sys.executable, "-m", "py_compile", *py_files]
+    command = [sys.executable, "-I", "-m", "py_compile", *py_files]
     result = service.run_command(command, timeout=config.command_timeout_seconds)
 
     if "error" in result:
@@ -87,20 +126,25 @@ _STATUS_LABELS = {
     "not_configured": "NOT CONFIGURED (no repository command was supplied)",
     "no_changes": "PASSED (no changed Python files needed a syntax check)",
     "unavailable": "SKIPPED (the verification command itself could not run)",
+    "blocked": "BLOCKED BY COMMAND SAFETY POLICY",
     "timeout": "FAILED (the command timed out)",
     "failed": "FAILED",
 }
 
 
 def verification_summary(result: dict) -> str:
-    """A short, human-readable summary of a run_verification() result, used in
-    reports returned to the Main Agent and in the Debugger's task prompt."""
+    """A short, human-readable summary of a `run_verification()` or
+    `run_scoped_verification()` result."""
     if "error" in result:
         error = result["error"]
         return f"Verification could not run ({error.get('code')}): {error.get('message')}"
 
-    label = _STATUS_LABELS.get(result.get("status"), "PASSED" if result["passed"] else "FAILED")
-    lines = [f"Verification command {result['command']!r} -> {label} (exit code {result.get('exit_code')})"]
+    label = _STATUS_LABELS.get(
+        result.get("status"), "PASSED" if result.get("passed") else "FAILED"
+    )
+    lines = [
+        f"Verification command {result.get('command')!r} -> {label} (exit code {result.get('exit_code')})"
+    ]
     if result.get("timed_out"):
         lines.append("The command timed out.")
     if result.get("stdout"):

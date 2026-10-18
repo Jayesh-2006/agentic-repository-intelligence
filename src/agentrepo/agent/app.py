@@ -1,7 +1,7 @@
 """Shared application setup and query execution.
 
 The module loads configuration, opens the indexed repository, builds the
-agent, and selects direct retrieval or agent execution for each query.
+agent, and runs each query through the Main Agent.
 
 Expected startup and runtime failures are raised as `AppError` with the
 original exception preserved as `__cause__`.
@@ -19,7 +19,13 @@ from ..service import RepoService
 from . import build_deep_agent
 from .config import AgentConfig, ConfigError, MissingApiKeyError, load_config
 from .model import build_llm
-from .simple_retrieval import QueryRetrievalCache, retrieve_query
+from .observability import (
+    RunTraceContext,
+    format_attribution_metrics,
+    format_run_diagnostic_summary,
+    reset_run_context,
+    start_run_context,
+)
 from .utils import describe_update, final_answer
 
 
@@ -29,14 +35,14 @@ class AppError(Exception):
 
 @dataclass
 class AgentApp:
-    agent: object          # the compiled Deep Agent graph
+    agent: object          # the compiled Deep Agent graph (or LazyDeepAgent)
     service: RepoService
     config: AgentConfig
     source: str            # human-readable description of where the index came from
 
 
 class LazyDeepAgent:
-    """Construct the LLM-backed graph only if retrieval needs a fallback."""
+    """Construct the LLM-backed Main Agent graph on first query execution."""
 
     def __init__(self, service: RepoService, config: AgentConfig):
         self.service = service
@@ -46,7 +52,11 @@ class LazyDeepAgent:
     def stream(self, input_state, stream_mode="updates", **kwargs):
         if self._graph is None:
             if not self.config.api_key:
-                raise AppError("Configuration error: GROQ_API_KEY is required for deep investigation.")
+                raise AppError(
+                    "Configuration error: GROQ_API_KEY is not set. Copy .env.example to .env, "
+                    "put your Groq API key in it (https://console.groq.com/keys), or export "
+                    "GROQ_API_KEY in your shell."
+                )
             llm = build_llm(self.config)
             self._graph = build_deep_agent(self.service, self.config, llm=llm)
         return self._graph.stream(input_state, stream_mode=stream_mode, **kwargs)
@@ -56,8 +66,7 @@ def load_app_config(max_steps: int | None = None) -> AgentConfig:
     """Load the existing configuration (.env / environment). max_steps, if
     given, overrides MAX_AGENT_STEPS (validated by AgentConfig as usual)."""
     try:
-        # Simple indexed lookups do not need an LLM credential. The key is
-        # checked only if run_query falls back to the Deep Agent.
+        # Defer the API key check until LazyDeepAgent initializes the Main Agent graph.
         config = load_config(require_api_key=False)
         if max_steps is not None:
             config = dataclasses.replace(config, max_agent_steps=max_steps)
@@ -103,42 +112,32 @@ def build_app(service: RepoService, config: AgentConfig, source: str) -> AgentAp
 
 def run_query(agent, query: str, on_line: Callable[[str], None] | None = None,
               service: RepoService | None = None) -> tuple[str, dict | None]:
-    """Use simple indexed retrieval when it can prove a direct fact; otherwise
-    run the existing Deep Agent. Returns (response, completion state)."""
+    """Run the query through the Main Agent.
+    Returns (response, completion state)."""
     query_started = time.perf_counter()
     service_metrics_before = _service_metrics(service)
-    input_state: dict = {"messages": [{"role": "user", "content": query}], "task": query}
-    query_service: QueryRetrievalCache | None = None
-    if service is not None:
-        direct_started = time.perf_counter()
-        retrieval = retrieve_query(service, query)
-        query_service = retrieval.cache
-        direct = retrieval.answer
-        if direct is not None:
-            if on_line:
-                for line in direct.trace:
-                    on_line(line)
-                _report_runtime_metrics(on_line, query_started, direct_ms=(time.perf_counter() - direct_started) * 1000,
-                                        cache=query_service, messages=[],
-                                        repository_metrics=_metric_delta(service_metrics_before,
-                                                                         _service_metrics(service)))
-            return direct.text, direct.completion
+    api_key = getattr(getattr(agent, "config", None), "api_key", None)
+    ctx, ctx_token = start_run_context(on_line=on_line, api_key=api_key)
+    try:
+        if on_line:
+            on_line("[Main] run started")
+        return _run_query_with_context(
+            agent, query, on_line, service, query_started, service_metrics_before, ctx
+        )
+    finally:
+        reset_run_context(ctx_token)
 
-        # Simple retrieval could not itself answer (or the question did not
-        # qualify for the shortcut at all) - hand the agent a pointer to
-        # where the indexed search already looked, not the search's content.
-        # This is deliberately weaker than passing along the retrieval
-        # attempt's actual evidence: it travels as `retrieval_hint`, a plain
-        # state field `decide` re-injects as its own system-data message
-        # every first turn (see deep_agent.py) - never as a second message
-        # in `messages`, which would both get mistaken for the task and get
-        # silently dropped from the model-facing history. The agent must
-        # still open the file and clear the normal evidence gate before it
-        # can cite anything from a hinted location, so a bad or irrelevant
-        # hint can only cost a wasted read, never a wrong answer stated as
-        # fact.
-        if retrieval.hints:
-            input_state["retrieval_hint"] = "\n".join(retrieval.hints)
+
+def _run_query_with_context(
+    agent,
+    query: str,
+    on_line: Callable[[str], None] | None,
+    service: RepoService | None,
+    query_started: float,
+    service_metrics_before: dict,
+    ctx: RunTraceContext,
+) -> tuple[str, dict | None]:
+    input_state: dict = {"messages": [{"role": "user", "content": query}], "task": query}
 
     messages: list = []
     completion = None
@@ -148,17 +147,9 @@ def run_query(agent, query: str, on_line: Callable[[str], None] | None = None,
     grader_metrics: dict = {}
     callback = _runtime_callback()
 
-    def report_metrics() -> None:
+    def report_metrics(run_exc: Exception | None = None) -> None:
         if on_line:
-            _report_runtime_metrics(
-                on_line, query_started,
-                direct_ms=(time.perf_counter() - query_started) * 1000 - sum(node_times.values()),
-                cache=query_service, messages=messages, node_times=node_times,
-                node_counts=node_counts, planned_steps=planned_steps,
-                grader_metrics=grader_metrics,
-                callback=callback,
-                repository_metrics=_metric_delta(service_metrics_before, _service_metrics(service)),
-            )
+            on_line(format_run_diagnostic_summary(ctx, completion, run_exception=run_exc))
 
     try:
         stream_started = time.perf_counter()
@@ -174,32 +165,32 @@ def run_query(agent, query: str, on_line: Callable[[str], None] | None = None,
                 if node == "plan_task":
                     planned_steps = len((update.get("plan") or {}).get("steps", []))
                 if on_line:
-                    for line in describe_update(node, update):
+                    for line in describe_update(node, update, agent="Main"):
                         on_line(line)
                 messages.extend(update.get("messages", []))
                 completion = update.get("completion") or completion
                 grader_metrics.update(update.get("runtime_metrics") or {})
             stream_started = time.perf_counter()
-    except AppError:
-        report_metrics()
+    except AppError as error:
+        report_metrics(error)
         raise
     except ImportError as error:
-        report_metrics()
+        report_metrics(error)
         raise AppError(f"A required package is missing ({error}). "
                        "Install the dependencies with: pip install -r requirements.txt") from error
     except Exception as error:
-        report_metrics()
+        report_metrics(error)
         raise AppError(f"The agent run failed: {error}") from error
     report_metrics()
     return final_answer(messages), completion
 
 
 def _report_runtime_metrics(on_line: Callable[[str], None], query_started: float,
-                            direct_ms: float = 0.0, cache: QueryRetrievalCache | None = None,
                             messages: list | None = None, node_times: dict[str, float] | None = None,
                             node_counts: dict[str, int] | None = None, planned_steps: int = 0,
                             grader_metrics: dict | None = None, callback=None,
-                            repository_metrics: dict | None = None) -> None:
+                            repository_metrics: dict | None = None,
+                            ctx: RunTraceContext | None = None) -> None:
     """Report invocation-local counters; provider token fields are optional."""
     llm_calls = tool_calls = duplicate_calls = tool_result_chars = 0
     input_tokens = output_tokens = 0
@@ -223,11 +214,30 @@ def _report_runtime_metrics(on_line: Callable[[str], None], query_started: float
             if getattr(message, "type", "") == "tool":
                 tool_result_chars += len(str(getattr(message, "content", "")))
 
+    if ctx is not None:
+        ctx_llm = sum(ctx.agent_llm_calls.values())
+        if ctx_llm > llm_calls:
+            llm_calls = ctx_llm
+        ctx_tools = sum(sum(t.values()) for t in ctx.agent_tool_calls.values())
+        if ctx_tools > tool_calls:
+            tool_calls = ctx_tools
+        if not tool_counts and ctx.agent_tool_calls:
+            tool_counts = {}
+            for by_tool in ctx.agent_tool_calls.values():
+                for t_name, cnt in by_tool.items():
+                    tool_counts[t_name] = tool_counts.get(t_name, 0) + cnt
+        if not token_data and ctx.stage_details:
+            ctx_in = sum(d.get("input_tokens", 0) for d in ctx.stage_details.values())
+            ctx_out = sum(d.get("output_tokens", 0) for d in ctx.stage_details.values())
+            if ctx_in or ctx_out:
+                input_tokens, output_tokens = ctx_in, ctx_out
+                token_data = True
+
     fields = [f"total_ms={int((time.perf_counter() - query_started) * 1000)}",
               f"llm_calls={llm_calls}", f"tool_calls={tool_calls}",
-              f"decision_calls={stages.get('decision', {}).get('calls', 0)}",
-              f"planning_calls={stages.get('planning', {}).get('calls', 0)}",
-              f"wrap_up_calls={stages.get('wrap_up', {}).get('calls', 0)}",
+              f"decision_calls={stages.get('decision', {}).get('calls', (ctx.stage_details.get('Main:decision', {}).get('calls', 0) if ctx else 0))}",
+              f"planning_calls={stages.get('planning', {}).get('calls', (ctx.stage_details.get('Main:planning', {}).get('calls', 0) if ctx else 0))}",
+              f"wrap_up_calls={stages.get('wrap_up', {}).get('calls', (ctx.stage_details.get('Main:wrap_up', {}).get('calls', 0) if ctx else 0))}",
               f"plan_steps={planned_steps}",
               "tool_counts=" + (",".join(f"{name}:{count}" for name, count in sorted(tool_counts.items())) or "none"),
               f"duplicate_tool_calls={duplicate_calls}", f"tool_result_chars={tool_result_chars}"]
@@ -235,20 +245,12 @@ def _report_runtime_metrics(on_line: Callable[[str], None], query_started: float
         fields.extend((f"input_tokens={input_tokens}", f"output_tokens={output_tokens}"))
     else:
         fields.append("token_usage=unavailable")
-    if cache is not None:
-        fields.extend((f"retrieval_searches={cache.search_calls}",
-                       f"retrieval_cache_hits={cache.search_hits}",
-                       f"retrieval_cache_misses={cache.search_calls - cache.search_hits}",
-                       f"retrieval_search_ms={int(cache.search_ms)}",
-                       f"retrieval_result_chars={cache.result_chars}",
-                       f"retrieval_file_reads={cache.file_reads}",
-                       f"retrieval_file_read_ms={int(cache.file_read_ms)}"))
     if node_times:
         fields.append("node_ms=" + ",".join(f"{name}:{int(duration)}" for name, duration in sorted(node_times.items())))
     if node_counts:
         fields.append("node_calls=" + ",".join(f"{name}:{count}" for name, count in sorted(node_counts.items())))
     grader_fields = {key: value for key, value in (grader_metrics or {}).items()
-                     if key.startswith("grader_")}
+                     if key.startswith(("grader_", "criterion_", "conclusion_"))}
     if grader_fields:
         fields.append("evidence_grader=" + ",".join(
             f"{key}:{value}" for key, value in sorted(grader_fields.items())))
@@ -256,6 +258,7 @@ def _report_runtime_metrics(on_line: Callable[[str], None], query_started: float
     followups = control.get("deterministic_followups") or []
     fields.extend(("deterministic_followups=" + ("|".join(map(str, followups)) or "none"),
                    f"deterministic_followup_count={control.get('deterministic_followup_count', 0)}",
+                   f"planning_parse_errors={control.get('planning_parse_errors', 0)}",
                    f"no_progress_stops={control.get('no_progress_stops', 0)}",
                    f"repeated_action_blocks={control.get('repeated_action_blocks', 0)}"))
     if callback is not None:
@@ -267,7 +270,7 @@ def _report_runtime_metrics(on_line: Callable[[str], None], query_started: float
         fields.append("repository=" + ",".join(
             f"{name}[calls={data['calls']},ms={int(data['latency_ms'])}]"
             for name, data in sorted(repository_metrics.items())))
-    fields.append(f"pre_agent_ms={int(direct_ms)}")
+    fields.extend(format_attribution_metrics(ctx))
     on_line("[Metrics] " + " ".join(fields))
 
 
@@ -379,3 +382,271 @@ def _runtime_callback():
 def completion_line(completion: dict) -> str:
     """One-line, user-facing summary of the evidence check."""
     return f"Evidence status: {completion['support']}"
+
+
+# ------------------------------------------------------------------
+# Rich Terminal UI & Structured Answer Parser
+# ------------------------------------------------------------------
+
+import re
+import sys
+from typing import Any
+
+try:
+    from rich.console import Console
+    from rich.markdown import Markdown
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from rich import box
+
+    RICH_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    RICH_AVAILABLE = False
+    Console = None  # type: ignore
+
+_SECTION_HEADERS = (
+    "Conclusion",
+    "Confirmed findings",
+    "Reasonable but unconfirmed possibilities",
+    "Supporting evidence",
+    "Evidence reviewed but not accepted as support",
+    "Unknown / unresolved",
+    "Unresolved",
+    "Agent draft (unverified; not accepted as the answer)",
+)
+
+_STEP_BULLET_RE = re.compile(r"^-\s*\[(step_\d+|c\d+)\]\s*([^:]+):\s*(.*)$")
+
+
+def parse_structured_answer(raw_answer: str) -> dict[str, Any]:
+    """Parse an ARI final answer string into structured sections (`conclusion`,
+    `supporting`, `reviewed`, `unresolved`, `draft`, etc.) for rich rendering."""
+    text = (raw_answer or "").strip()
+    if not text:
+        return {"conclusion": "", "sections": []}
+
+    lines = text.splitlines()
+    sections: list[tuple[str, list[str]]] = []
+    current_title = "Conclusion"
+    current_lines: list[str] = []
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if idx == 0 and stripped == "Conclusion":
+            current_title = "Conclusion"
+            continue
+        if stripped in _SECTION_HEADERS and (idx == 0 or not lines[idx - 1].strip()):
+            if current_lines or current_title != "Conclusion":
+                sections.append((current_title, current_lines))
+            current_title = stripped
+            current_lines = []
+        else:
+            current_lines.append(line)
+
+    if current_lines or not sections:
+        sections.append((current_title, current_lines))
+
+    conclusion_body = ""
+    other_sections: list[tuple[str, str]] = []
+    for title, body_lines in sections:
+        body = "\n".join(body_lines).strip()
+        if title == "Conclusion" and not conclusion_body:
+            conclusion_body = body
+        elif body:
+            other_sections.append((title, body))
+
+    return {
+        "conclusion": conclusion_body or text,
+        "sections": other_sections,
+    }
+
+
+class RichTerminalUI:
+    """Renders startup banners, live agent trace lines, and structured answers."""
+
+    def __init__(self, *, use_rich: bool = True) -> None:
+        self.enabled = bool(use_rich and RICH_AVAILABLE)
+        self.stdout = Console(soft_wrap=False) if self.enabled else None
+        self.stderr = Console(stderr=True, soft_wrap=False) if self.enabled else None
+
+    def print_banner(
+        self,
+        *,
+        repo_path: str,
+        index_dir: str | None,
+        symbol_count: int,
+        chunk_count: int,
+        model_name: str,
+        retriever_name: str = "BM25Plus",
+    ) -> None:
+        if not self.enabled or self.stdout is None:
+            print("Repository Intelligence Agent", flush=True)
+            print("=============================", flush=True)
+            print(f"Repository: {repo_path}", flush=True)
+            if index_dir:
+                print(f"Index: {index_dir}", flush=True)
+            print(f"Symbols: {symbol_count} | Chunks: {chunk_count} | Retriever: {retriever_name}", flush=True)
+            print(f"Model: {model_name}\n", flush=True)
+            return
+
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column(style="bold cyan", justify="right")
+        grid.add_column(style="white")
+        grid.add_row("Repository:", str(repo_path))
+        if index_dir:
+            grid.add_row("Index:", str(index_dir))
+        grid.add_row("Indexed:", f"[bold]{symbol_count}[/bold] symbols, [bold]{chunk_count}[/bold] chunks")
+        grid.add_row("Retriever:", f"[green]{retriever_name}[/green]")
+        grid.add_row("Model:", f"[magenta]{model_name}[/magenta]")
+
+        self.stdout.print(
+            Panel(
+                grid,
+                title="[bold bright_cyan]Agentic Repository Intelligence (ARI)[/bold bright_cyan]",
+                border_style="bright_blue",
+                box=box.ROUNDED,
+                expand=False,
+            )
+        )
+        sys.stdout.flush()
+
+    def print_trace(self, line: str) -> None:
+        """Render a single live trace line to stderr with color-coded badges."""
+        if not self.enabled or self.stderr is None:
+            print(line, file=sys.stderr, flush=True)
+            return
+
+        raw = (line or "").strip()
+        if not raw:
+            return
+
+        text = Text()
+        if raw.startswith("[Main] run started"):
+            text.append("▶ ", style="bold bright_cyan")
+            text.append(raw, style="bold cyan")
+        elif "run completed ->" in raw:
+            if "SUPPORTED" in raw:
+                text.append("✔ ", style="bold bright_green")
+                text.append(raw, style="bold green")
+            elif "PARTIAL" in raw:
+                text.append("◐ ", style="bold yellow")
+                text.append(raw, style="bold yellow")
+            else:
+                text.append("✖ ", style="bold bright_red")
+                text.append(raw, style="bold red")
+        elif "-> FAILED" in raw or "ERROR" in raw:
+            text.append("✖ ", style="bold bright_red")
+            text.append(raw, style="red")
+        elif "-> BLOCKED" in raw:
+            text.append("⚡ ", style="bold yellow")
+            text.append(raw, style="yellow")
+        elif "-> EMPTY" in raw:
+            text.append("○ ", style="dim yellow")
+            text.append(raw, style="dim yellow")
+        elif "search_repository" in raw:
+            text.append("🔍 ", style="cyan")
+            text.append(raw, style="bright_white")
+        elif "get_file" in raw or "get_symbol" in raw:
+            text.append("📄 ", style="green")
+            text.append(raw, style="bright_white")
+        elif "write_file" in raw or "verify_repository" in raw or "run_command" in raw:
+            text.append("🛠  ", style="magenta")
+            text.append(raw, style="bright_magenta")
+        else:
+            text.append("• ", style="dim cyan")
+            text.append(raw, style="dim white")
+
+        self.stderr.print(text)
+
+    def print_answer(self, answer: str, completion: dict | None = None) -> None:
+        """Render the structured answer and evidence sections using Rich panels/tables."""
+        if not self.enabled or self.stdout is None:
+            print("\nAnswer\n------", flush=True)
+            print(answer or "(the agent produced no answer)", flush=True)
+            if completion:
+                print(f"\nEvidence status: {completion.get('support', 'UNKNOWN')}", flush=True)
+            return
+
+        self.stdout.print()
+        if not (answer or "").strip():
+            self.stdout.print(
+                Panel("(the agent produced no answer)", title="Answer", border_style="yellow")
+            )
+            return
+
+        parsed = parse_structured_answer(answer)
+        support = (completion or {}).get("support", "SUPPORTED")
+        border_color = (
+            "bright_green"
+            if support == "SUPPORTED"
+            else ("yellow" if support == "PARTIAL" else "bright_red")
+        )
+
+        # 1. Main Conclusion Panel rendered as Rich Markdown (supports code blocks, tables, bold, lists)
+        self.stdout.print(
+            Panel(
+                Markdown(parsed["conclusion"]),
+                title=f"[bold {border_color}]Conclusion[/bold {border_color}]",
+                border_style=border_color,
+                box=box.ROUNDED,
+                padding=(1, 2),
+            )
+        )
+
+        # 2. Supporting / Reviewed / Unresolved sections
+        for sec_title, sec_body in parsed["sections"]:
+            if sec_title in ("Supporting evidence", "Evidence reviewed but not accepted as support"):
+                table = Table(
+                    title=f"[bold cyan]{sec_title}[/bold cyan]",
+                    box=box.SIMPLE_HEAVY,
+                    show_lines=True,
+                    expand=True,
+                )
+                table.add_column("Step", style="bold cyan", width=10, no_wrap=True)
+                table.add_column("Tool & Location", style="bold green", width=34)
+                table.add_column("Recorded Excerpt", style="white")
+
+                any_rows = False
+                for line in sec_body.splitlines():
+                    m = _STEP_BULLET_RE.match(line.strip())
+                    if m:
+                        step_id, action, excerpt = m.groups()
+                        table.add_row(f"[{step_id}]", action.strip(), excerpt.strip())
+                        any_rows = True
+                    elif line.strip():
+                        table.add_row("", "", line.strip().lstrip("- "))
+                        any_rows = True
+                if any_rows:
+                    self.stdout.print(table)
+            elif "unresolved" in sec_title.lower() or "unverified" in sec_title.lower():
+                self.stdout.print(
+                    Panel(
+                        Markdown(sec_body),
+                        title=f"[bold yellow]{sec_title}[/bold yellow]",
+                        border_style="yellow",
+                        box=box.ROUNDED,
+                    )
+                )
+            else:
+                self.stdout.print(
+                    Panel(
+                        Markdown(sec_body),
+                        title=f"[bold cyan]{sec_title}[/bold cyan]",
+                        border_style="cyan",
+                        box=box.ROUNDED,
+                    )
+                )
+
+        # 3. Evidence status badge
+        if completion:
+            c_sup = completion.get("criteria_supported")
+            c_tot = completion.get("criteria_total")
+            ratio = f" ({c_sup}/{c_tot} criteria)" if c_sup is not None and c_tot is not None else ""
+            badge = Text()
+            badge.append("Evidence status: ", style="bold white")
+            badge.append(f" {support} ", style=f"bold black on {border_color}")
+            if ratio:
+                badge.append(ratio, style="dim white")
+            self.stdout.print(badge)
+        sys.stdout.flush()

@@ -26,6 +26,7 @@ TEXT_FILENAMES = {"readme", "license", "licence", "copying", "notice", "authors"
                   "dockerfile", "makefile", "requirements"}  # compared to the lower-cased name without extension
 MAX_TEXT_BYTES = 200_000  # bigger files are listed but not content-indexed
 TEXT_CHUNK_LINES = 40
+TEXT_CHUNK_STRIDE = 34
 
 def _iter_python_files(root: Path):
     paths = []
@@ -85,13 +86,16 @@ def _build_text_chunks(root: Path, repo_files: list[str]) -> dict[str, Chunk]:
         if not text or not text.strip():
             continue
         lines = text.splitlines()
-        for number, start in enumerate(range(0, len(lines), TEXT_CHUNK_LINES), start=1):
+        stride = TEXT_CHUNK_STRIDE if len(lines) > TEXT_CHUNK_LINES else TEXT_CHUNK_LINES
+        for number, start in enumerate(range(0, len(lines), stride), start=1):
             part = lines[start:start + TEXT_CHUNK_LINES]
             if not "".join(part).strip():
                 continue
             chunk_id = f"{rel_path}#text{number}"
             chunks[chunk_id] = Chunk(id=chunk_id, symbol_id=None, file=rel_path, kind="text",
                                      start_line=start + 1, end_line=start + len(part), text="\n".join(part))
+            if start + TEXT_CHUNK_LINES >= len(lines):
+                break
     return chunks
 
 

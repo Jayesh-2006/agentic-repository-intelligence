@@ -1,4 +1,4 @@
-"""Small, conservative policies for obvious read-only follow-up actions."""
+"""Small, conservative policies for obvious read-only follow-up actions and result fingerprinting."""
 
 from __future__ import annotations
 
@@ -82,8 +82,20 @@ def result_fingerprint(tool_name: str, report: str) -> str:
         elif tool_name == "get_file":
             semantic = {key: data.get(key) for key in
                         ("file", "line_start", "line_end", "total_lines", "truncated", "content")}
-        elif tool_name == "investigate_repository":
-            semantic = {"observations": _strip_request_echo(data.get("raw_observations", []))}
+        elif tool_name == "get_symbol":
+            semantic = {key: data.get(key) for key in
+                        ("symbol", "kind", "file", "line_start", "line_end", "truncated", "source")}
+        elif tool_name == "find_callers":
+            semantic = {key: data.get(key) for key in ("symbol", "callers", "possible_callers", "truncated")}
+        elif tool_name == "find_callees":
+            semantic = {key: data.get(key) for key in ("symbol", "callees", "possible_callees", "external_calls")}
+        elif tool_name == "find_importers":
+            semantic = {key: data.get(key) for key in ("module", "file", "importers")}
+        elif tool_name == "get_dependencies":
+            semantic = {key: data.get(key) for key in ("symbol", "file", "depends_on", "depended_on_by")}
+        elif tool_name == "get_ast":
+            semantic = {key: data.get(key) for key in
+                        ("symbol", "kind", "node_type", "file", "line_start", "line_end", "children", "calls", "imports")}
         else:
             semantic = _strip_request_echo(data)
     else:
@@ -102,11 +114,7 @@ def similar_action(left: str, right: str) -> bool:
 
 
 def _same_file_name(pattern: str, path: str) -> bool:
-    """True when `pattern` plausibly names `path`: the full normalized path,
-    its basename, or the basename without its extension (so a pattern like
-    "README" matches a found path of "README.md" - a one-exact-match
-    find_files result naming a file by its common/stem name, without the
-    extension, is exactly the case this auto-follow-up exists for)."""
+    """True when `pattern` plausibly names `path`."""
     normalized = path.replace("\\", "/").strip(" ./").casefold()
     basename = normalized.rsplit("/", 1)[-1]
     stem = basename.rsplit(".", 1)[0] if "." in basename else basename
