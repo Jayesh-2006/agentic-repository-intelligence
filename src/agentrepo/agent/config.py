@@ -50,7 +50,7 @@ DEFAULT_ENABLE_CHECKPOINTS = True
 DEFAULT_ROLLBACK_ON_REPAIR_LIMIT = True
 # Sized for an 8,000-token provider request limit with headroom (the estimator
 # in context_budget.py over-counts, and tool schemas are counted inside it).
-DEFAULT_CONTEXT_TOKEN_BUDGET = 6500
+DEFAULT_CONTEXT_TOKEN_BUDGET = 25000
 MIN_CONTEXT_TOKEN_BUDGET = 1000
 MAX_CONTEXT_TOKEN_BUDGET = 1_000_000
 # Must match RepoService.MAX_COMMAND_TIMEOUT (service.py). Duplicated here
@@ -105,14 +105,19 @@ def load_config(require_api_key: bool = True, env: Mapping[str, str] | None = No
         load_dotenv()  # does not override variables already set in the environment
         env = os.environ
 
-    # Prefer Gemini variables. GROQ_* aliases remain supported so older
-    # deployments can migrate their .env file without changing other settings.
-    api_key = (env.get("GEMINI_API_KEY") or env.get("GROQ_API_KEY") or "").strip() or None
+    # Prefer Gemini variables (GEMINI_API_KEY or GOOGLE_API_KEY). GROQ_* aliases
+    # remain supported so older deployments can migrate their .env file smoothly.
+    api_key = (
+        env.get("GEMINI_API_KEY")
+        or env.get("GOOGLE_API_KEY")
+        or env.get("GROQ_API_KEY")
+        or ""
+    ).strip() or None
     if require_api_key and api_key is None:
         raise MissingApiKeyError(
             "GEMINI_API_KEY is not set. Copy .env.example to .env, add your Gemini API key "
             "(https://aistudio.google.com/apikey), or export GEMINI_API_KEY in your shell. "
-            "Legacy GROQ_API_KEY is also accepted temporarily."
+            "GOOGLE_API_KEY and legacy GROQ_API_KEY are also accepted."
         )
 
     model = (env.get("GEMINI_MODEL") or env.get("GROQ_MODEL") or "").strip() or DEFAULT_MODEL

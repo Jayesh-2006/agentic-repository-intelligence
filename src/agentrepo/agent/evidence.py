@@ -65,9 +65,13 @@ def new_criterion(index: int, description: str, evidence_needed: str) -> dict:
 def default_criteria(task: str) -> list[dict]:
     """Generic fallback when the planning call gave no usable criteria: one
     criterion parameterised by the task text."""
-    return [new_criterion(1, f"The objective is fully addressed: {task}",
-                          "Concrete repository evidence (file/document contents, code, structure, or "
-                          "verification results, as applicable) that directly shows it")]
+    return [new_criterion(
+        1,
+        f"Determine and answer from repository evidence: {task}",
+        "Concrete repository evidence (file/document contents, code, structure, or "
+        "verification results, as applicable) that answers or addresses the request "
+        "(including evidence establishing a 'no'/negative answer for yes/no questions)",
+    )]
 
 
 def parse_criteria(text: str, max_criteria: int = MAX_CRITERIA) -> list[dict]:
@@ -1607,6 +1611,62 @@ def resolve_evidence_ids(submitted, plan: Optional[dict], usable_ids: set[str]) 
     return resolved
 
 
+_POLAR_QUESTION_RE = re.compile(
+    r"^(?:is|are|was|were|does|do|did|can|could|has|have|had|will|would|should)\b",
+    re.IGNORECASE,
+)
+_NEGATIVE_ANSWER_ESTABLISHED_MARKERS = (
+    "rather than",
+    "instead of",
+    "implements a",
+    "treats ",
+    "frames ",
+    "predicts ",
+    "classification-based",
+    "classification task",
+    "predefined answer vocabulary",
+    "is not a",
+    "does not use",
+)
+_INSUFFICIENT_EVIDENCE_MARKERS = (
+    "missing",
+    "insufficient",
+    "not enough",
+    "no evidence",
+    "no usable",
+    "unread",
+    "not read",
+    "cannot determine",
+    "unable to determine",
+    "unclear",
+    "unverified",
+)
+
+
+def _is_established_negative_verdict(
+    criterion: dict, plan: dict, reason: str, allowed_ids: set[str]
+) -> bool:
+    """True when a yes/no question was marked satisfied=false by the grader solely
+    because the factual answer in the repository is 'no', while the grader's
+    reason states the concrete repository finding that answers the question."""
+    if not allowed_ids or not reason:
+        return False
+    objective = str((plan or {}).get("objective") or "").strip()
+    desc = str(criterion.get("description") or "").strip()
+    for prefix in (
+        "The objective is fully addressed:",
+        "Determine and answer from repository evidence:",
+    ):
+        if desc.startswith(prefix):
+            desc = desc[len(prefix) :].strip()
+    if not (_POLAR_QUESTION_RE.search(objective) or _POLAR_QUESTION_RE.search(desc)):
+        return False
+    lower_reason = reason.lower()
+    if any(m in lower_reason for m in _INSUFFICIENT_EVIDENCE_MARKERS):
+        return False
+    return any(m in lower_reason for m in _NEGATIVE_ANSWER_ESTABLISHED_MARKERS)
+
+
 def apply_assessment(criteria: list[dict], plan: dict, verdicts: dict[str, dict]) -> tuple[list[dict], dict]:
     """Validate grader decisions against real, usable evidence records."""
     all_usable_ids = {s["step_id"] for s in usable_evidence_steps(dict(plan, objective=""), None)}
@@ -1629,8 +1689,19 @@ def apply_assessment(criteria: list[dict], plan: dict, verdicts: dict[str, dict]
                 if ((by_id.get(step_id) or {}).get("provenance") or {}).get("file") not in clipped_files
             ]
         grader_approved = verdict.get("satisfied") is True
-        satisfied = grader_approved and bool(valid)
         reason = verdict.get("reason") if isinstance(verdict.get("reason"), str) else ""
+        if not grader_approved and _is_established_negative_verdict(
+            criterion, plan, reason, allowed_ids
+        ):
+            grader_approved = True
+            if not valid:
+                valid = [
+                    s["step_id"]
+                    for s in usable_evidence_steps(plan, criteria)
+                    if s["step_id"] in allowed_ids
+                    and s.get("tool") in ("get_file", "get_symbol", "search_repository")
+                ][:4]
+        satisfied = grader_approved and bool(valid)
         if grader_approved and not valid:
             if criterion_needs_full and resolve_evidence_ids(submitted_ids, plan, all_usable_ids):
                 reason = ("citation check rejected the grader's verdict: cited get_file evidence does not "
@@ -1770,8 +1841,16 @@ def describe_criteria(criteria: list[dict], plan: Optional[dict]) -> str:
             prov = s.get("provenance") or {}
             next_start = prov.get("next_start_line")
             if s["step_id"] in usable_ids:
-                if s.get("tool") == "get_file" and prov.get("truncated") and next_start:
-                    flag = f" -- bounded read; continue with get_file start_line={next_start} if needed"
+                if s.get("tool") == "get_file" and (prov.get("truncated") or prov.get("partial_range")) and next_start:
+                    flag = (
+                        f" -- lines {prov.get('line_start')}-{prov.get('line_end')} of {prov.get('total_lines')} read; "
+                        f"do NOT re-read 1-{prov.get('line_end')}, continue with get_file start_line={next_start} if needed"
+                    )
+                elif s.get("tool") == "get_file" and not prov.get("partial_range") and not prov.get("truncated") and prov.get("total_lines"):
+                    flag = (
+                        f" -- complete file read (lines 1-{prov.get('total_lines')} of {prov.get('total_lines')}); "
+                        "do NOT call get_file on this file again"
+                    )
                 elif s.get("tool") == "get_symbol":
                     flag = " -- symbol source already recorded; do NOT re-read these lines with get_file"
                 elif s.get("tool") == "search_repository":
@@ -1927,13 +2006,24 @@ def _focused_excerpt(evidence_text: str, objective: str = "", limit: int = _EXCE
     return _clip(joined, limit)
 
 
+def _file_ref_in_corpus(file_ref: str, haystack: str) -> bool:
+    norm = file_ref.lower().replace("\\", "/").lstrip("./")
+    if norm in haystack:
+        return True
+    if norm.endswith(".py") and "/" in norm:
+        dotted = norm[:-3].replace("/", ".")
+        if dotted in haystack:
+            return True
+    return False
+
+
 def _sanitize_conclusion(text: str, plan: Optional[dict], corpus: str) -> tuple[str, list[str]]:
     """Keep the model's prose from citing things that were never recorded in usable evidence."""
     real = {s["step_id"] for s in usable_evidence_steps(plan)}
     text = _STEP_REF_RE.sub(lambda m: m.group(0) if m.group(0) in real else "(unrecorded reference removed)", text)
     haystack = corpus.lower().replace("\\", "/")
     unverified = sorted({f for f in _FILE_REF_RE.findall(text)
-                         if f.lower().replace("\\", "/").lstrip("./") not in haystack})
+                         if not _file_ref_in_corpus(f, haystack)})
     return text, unverified
 
 

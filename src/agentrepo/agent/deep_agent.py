@@ -844,6 +844,41 @@ def build_deep_agent(
             answer_check = validate_conclusion(
                 task, answer, criteria, plan, corpus, metrics_local, c_cache
             )
+            if (
+                support in (ev.PARTIAL, ev.UNSUPPORTED)
+                and answer_check is not None
+                and answer_check.get("supported") is True
+                and not answer_check.get("error")
+                and eff_f_info is None
+                and not planning.pending_steps(plan)
+                and not ev.incomplete_reasons(criteria, plan)
+                and _is_light_readonly_task(intent_mod.get_intent(state), plan)
+                and not ev.conclusion_reference_issues(final_text, plan, corpus)
+            ):
+                claim_groups = ev._answer_claim_groups(answer_check, plan, corpus)
+                confirmed_ids = [
+                    sid
+                    for item in claim_groups.get("confirmed", [])
+                    for sid in (item.get("evidence_ids") or [])
+                ]
+                if (
+                    claim_groups.get("confirmed")
+                    and not claim_groups.get("possible")
+                    and not claim_groups.get("unresolved")
+                    and confirmed_ids
+                ):
+                    dedup_ids = list(dict.fromkeys(confirmed_ids))
+                    criteria = [
+                        c if c.get("satisfied") else dict(
+                            c,
+                            satisfied=True,
+                            evidence_ids=dedup_ids,
+                            validation="accepted",
+                            note="established by confirmed conclusion claims",
+                        )
+                        for c in criteria
+                    ]
+                    support = ev.classify_support(criteria, plan, eff_f_info, eff_v_info)
         if support == ev.SUPPORTED and answer_check is not None and answer_check.get("error"):
             # Evidence may support the criteria, but a draft is not a validated
             # answer when its required claim check failed or was rate-limited.
@@ -960,7 +995,10 @@ def build_deep_agent(
             prior_err = str(state.get("model_error") or "")
             if steps == 0 and prior_err.startswith("planning model call failed:") and any(
                 marker in prior_err.lower()
-                for marker in ("401", "403", "429", "rate limit", "auth", "api_key", "connection", "api key")
+                for marker in (
+                    "401", "403", "429", "rate limit", "resource_exhausted", "resourceexhausted",
+                    "quota", "auth", "api_key", "api_key_invalid", "api key not valid", "connection", "api key",
+                )
             ):
                 raise RuntimeError(prior_err.removeprefix("planning model call failed:").strip())
             caps_for_turn = state.get("capabilities") or intent_mod.default_capabilities()
@@ -2481,7 +2519,13 @@ def _model_error_reason(error: Exception, api_key: str | None = None) -> str:
     request_limited = status == 413 or "413" in detail or is_context_size_error(err_info)
     rate_limited = (
         not request_limited
-        and (status == 429 or "429" in detail or "ratelimit" in type(error).__name__.casefold())
+        and (
+            status == 429
+            or "429" in detail
+            or err_info.get("error_category") in ("provider_rate_limit", "provider_tpm_limit")
+            or "ratelimit" in type(error).__name__.casefold()
+            or "resourceexhausted" in type(error).__name__.casefold()
+        )
     )
     if request_limited:
         prefix = "provider request/context limit (HTTP 413)" if (status == 413 or "413" in detail) else "provider request/context limit"

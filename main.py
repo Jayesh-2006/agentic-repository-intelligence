@@ -10,7 +10,7 @@ Interactive (one query per prompt; type help, status, refresh, or exit/quit):
     python main.py --repo /path/to/repository
     python main.py --repo /path/to/repository --index-dir data/index
 
-Configuration (GROQ_API_KEY, GROQ_MODEL, ...) comes from .env or the
+Configuration (GEMINI_API_KEY, GEMINI_MODEL, ...) comes from .env or the
 environment - see .env.example. --index-dir loads an index saved with
 scripts/build_index.py; without it the repository is indexed in memory.
 The progress trace goes to stderr, the final response to stdout.

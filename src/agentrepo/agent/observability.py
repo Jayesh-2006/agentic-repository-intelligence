@@ -32,6 +32,7 @@ _SECRET_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 _INLINE_SECRET_PATTERNS = (
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"), "[REDACTED]"),
     (re.compile(r"\bgsk_[A-Za-z0-9]{12,}\b"), "[REDACTED]"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"), "[REDACTED]"),
     (re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._\-+/=]{8,}"), r"\1[REDACTED]"),
@@ -190,9 +191,10 @@ def redact_secrets(text: str, api_key: str | None = None) -> str:
         out = str(text or "")
         if api_key and len(api_key.strip()) >= 4:
             out = out.replace(api_key.strip(), "[REDACTED]")
-        env_key = os.environ.get("GROQ_API_KEY", "").strip()
-        if env_key and len(env_key) >= 4:
-            out = out.replace(env_key, "[REDACTED]")
+        for env_var in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GROQ_API_KEY"):
+            env_key = os.environ.get(env_var, "").strip()
+            if env_key and len(env_key) >= 4:
+                out = out.replace(env_key, "[REDACTED]")
         for pattern, replacement in _INLINE_SECRET_PATTERNS:
             out = pattern.sub(replacement, out)
         return out
@@ -608,7 +610,14 @@ def extract_model_identity(model: Any) -> dict[str, Any]:
     )
     cls_name = type(target).__name__
     mod_name = type(target).__module__.lower()
-    if "groq" in mod_name or "groq" in cls_name.lower():
+    if (
+        "google" in mod_name
+        or "gemini" in mod_name
+        or "google" in cls_name.lower()
+        or "gemini" in cls_name.lower()
+    ):
+        provider = "google"
+    elif "groq" in mod_name or "groq" in cls_name.lower():
         provider = "groq"
     elif "openai" in mod_name or "openai" in cls_name.lower():
         provider = "openai"
@@ -716,7 +725,27 @@ def analyze_provider_error(
         "context_length" in lower
         or "context window" in lower
         or "maximum context length" in lower
+        or "exceeds the maximum number of tokens" in lower
+        or "token count exceeds" in lower
+        or "input token limit" in lower
         or provider_code == "context_length_exceeded"
+    )
+    is_rate_or_quota = (
+        status == 429
+        or "ratelimit" in err_cls.casefold()
+        or "resourceexhausted" in err_cls.casefold()
+        or "resource_exhausted" in lower
+        or "resource exhausted" in lower
+        or "quota exceeded" in lower
+        or "quota" in lower
+        or provider_code in ("rate_limit_exceeded", "resource_exhausted")
+    )
+    is_auth_error = (
+        status in (401, 403)
+        or "auth" in err_cls.casefold()
+        or "permission" in err_cls.casefold()
+        or "api_key_invalid" in lower
+        or "api key not valid" in lower
     )
 
     if is_tpm:
@@ -728,10 +757,10 @@ def analyze_provider_error(
     elif status == 413:
         error_category = "provider_request_too_large"
         limit_kind = "request_payload_size"
-    elif status == 429 or "ratelimit" in err_cls.casefold() or provider_code == "rate_limit_exceeded":
+    elif is_rate_or_quota:
         error_category = "provider_rate_limit"
         limit_kind = "rate_limit"
-    elif status in (401, 403) or "auth" in err_cls.casefold() or "permission" in err_cls.casefold():
+    elif is_auth_error:
         error_category = "provider_auth_error"
         limit_kind = "none"
     elif isinstance(status, int) and 500 <= status < 600:
@@ -973,6 +1002,11 @@ def invoke_model_logged(
             if usage["available"]:
                 st["input_tokens"] += usage["input_tokens"]
                 st["output_tokens"] += usage["output_tokens"]
+    if stage == "decision":
+        t_calls = getattr(reply, "tool_calls", None) or []
+        action_note = f"calling {len(t_calls)} tool(s)" if t_calls else "writing final answer"
+        turn_note = f" (turn {turn})" if turn is not None else ""
+        emit_trace(f"[{agent}] decision{turn_note} -> {action_note} ({elapsed_ms} ms)")
     return reply
 
 
@@ -1165,8 +1199,17 @@ def log_tool_execution_exception(
 
 
 def log_plan_initialized(plan: dict, criteria: list[dict], intent: dict) -> None:
-    """Suppressed on normal execution to avoid plan lifecycle telemetry noise."""
-    return
+    """Emit a concise planning summary line."""
+    try:
+        steps = (plan or {}).get("steps") or []
+        kind = (intent or {}).get("kind", "explain")
+        depth = (intent or {}).get("depth", "standard")
+        emit_trace(
+            f"[Main] planning -> {len(steps)} step(s), {len(criteria or [])} criterion/criteria "
+            f"(intent: {kind}/{depth})"
+        )
+    except Exception:
+        pass
 
 
 def log_plan_step_transition(

@@ -53,9 +53,9 @@ class LazyDeepAgent:
         if self._graph is None:
             if not self.config.api_key:
                 raise AppError(
-                    "Configuration error: GROQ_API_KEY is not set. Copy .env.example to .env, "
-                    "put your Groq API key in it (https://console.groq.com/keys), or export "
-                    "GROQ_API_KEY in your shell."
+                    "Configuration error: GEMINI_API_KEY is not set. Copy .env.example to .env, "
+                    "add your Gemini API key (https://aistudio.google.com/apikey), or export "
+                    "GEMINI_API_KEY in your shell."
                 )
             llm = build_llm(self.config)
             self._graph = build_deep_agent(self.service, self.config, llm=llm)
@@ -276,7 +276,7 @@ def _report_runtime_metrics(on_line: Callable[[str], None], query_started: float
 
 def _service_metrics(service) -> dict:
     snapshot = getattr(service, "runtime_metrics_snapshot", None)
-    return snapshot() if callable(snapshot) else {}
+    return snapshot() if callable(snapshot) else {} # pyright: ignore[reportReturnType]
 
 
 def _metric_delta(before: dict, after: dict) -> dict:
@@ -399,11 +399,13 @@ try:
     from rich.table import Table
     from rich.text import Text
     from rich import box
+    from rich.markup import escape
 
     RICH_AVAILABLE = True
 except ImportError:  # pragma: no cover
     RICH_AVAILABLE = False
     Console = None  # type: ignore
+    escape = lambda s: s  # type: ignore
 
 _SECTION_HEADERS = (
     "Conclusion",
@@ -416,7 +418,19 @@ _SECTION_HEADERS = (
     "Agent draft (unverified; not accepted as the answer)",
 )
 
-_STEP_BULLET_RE = re.compile(r"^-\s*\[(step_\d+|c\d+)\]\s*([^:]+):\s*(.*)$")
+_STEP_BULLET_RE = re.compile(
+    r"^-\s*\[(?P<step_id>step_\d+|c\d+)\]\s*"
+    r"(?P<action>"
+        r"[a-zA-Z_]+:\s*[^:\n]+:\d+(?:-\d+)?"
+        r"|[a-zA-Z_]+:\s*[^:\n]+\s*\([^)]*\)"
+        r'|[a-zA-Z_]+:\s*"[^"]*"'
+        r"|[a-zA-Z_]+:\s*'[^']*'"
+        r"|[a-zA-Z_]+:\s*[^:\n]+"
+        r"|[a-zA-Z_]+\s+[^:\n]+:\d+(?:-\d+)?"
+        r"|[a-zA-Z_]+\([^)]*\)"
+        r"|[^:]+"
+    r"):\s*(?P<excerpt>.*)$"
+)
 
 
 def parse_structured_answer(raw_answer: str) -> dict[str, Any]:
@@ -433,13 +447,14 @@ def parse_structured_answer(raw_answer: str) -> dict[str, Any]:
 
     for idx, line in enumerate(lines):
         stripped = line.strip()
-        if idx == 0 and stripped == "Conclusion":
+        clean_title = re.sub(r"^[#*\s_]+|[#*\s_:]+$", "", stripped).strip()
+        if idx == 0 and clean_title == "Conclusion":
             current_title = "Conclusion"
             continue
-        if stripped in _SECTION_HEADERS and (idx == 0 or not lines[idx - 1].strip()):
+        if (clean_title in _SECTION_HEADERS or stripped in _SECTION_HEADERS) and (idx == 0 or not lines[idx - 1].strip()):
             if current_lines or current_title != "Conclusion":
                 sections.append((current_title, current_lines))
-            current_title = stripped
+            current_title = clean_title if clean_title in _SECTION_HEADERS else stripped
             current_lines = []
         else:
             current_lines.append(line)
@@ -464,10 +479,11 @@ def parse_structured_answer(raw_answer: str) -> dict[str, Any]:
 
 class RichTerminalUI:
     """Renders startup banners, live agent trace lines, and structured answers."""
+    # pyright: ignore[reportMissingTypeStubs]
 
     def __init__(self, *, use_rich: bool = True) -> None:
         self.enabled = bool(use_rich and RICH_AVAILABLE)
-        self.stdout = Console(soft_wrap=False) if self.enabled else None
+        self.stdout = Console(soft_wrap=False) if self.enabled else None # pyright: ignore[reportOptionalCall]
         self.stderr = Console(stderr=True, soft_wrap=False) if self.enabled else None
 
     def print_banner(
@@ -490,7 +506,7 @@ class RichTerminalUI:
             print(f"Model: {model_name}\n", flush=True)
             return
 
-        grid = Table.grid(padding=(0, 2))
+        grid = Table.grid(padding=(0, 2)) # pyright: ignore[reportPossiblyUnboundVariable]
         grid.add_column(style="bold cyan", justify="right")
         grid.add_column(style="white")
         grid.add_row("Repository:", str(repo_path))
@@ -501,7 +517,7 @@ class RichTerminalUI:
         grid.add_row("Model:", f"[magenta]{model_name}[/magenta]")
 
         self.stdout.print(
-            Panel(
+            Panel( # type: ignore
                 grid,
                 title="[bold bright_cyan]Agentic Repository Intelligence (ARI)[/bold bright_cyan]",
                 border_style="bright_blue",
@@ -521,7 +537,8 @@ class RichTerminalUI:
         if not raw:
             return
 
-        text = Text()
+        text = Text() # type: ignore
+        # 1. Lifecycle start / end
         if raw.startswith("[Main] run started"):
             text.append("▶ ", style="bold bright_cyan")
             text.append(raw, style="bold cyan")
@@ -535,17 +552,50 @@ class RichTerminalUI:
             else:
                 text.append("✖ ", style="bold bright_red")
                 text.append(raw, style="bold red")
-        elif "-> FAILED" in raw or "ERROR" in raw:
+
+        # 2. Errors, guard blocks, empty results, and context compaction retries
+        elif "-> FAILED" in raw or "ERROR" in raw or "budget NOT met" in raw:
             text.append("✖ ", style="bold bright_red")
             text.append(raw, style="red")
         elif "-> BLOCKED" in raw:
             text.append("⚡ ", style="bold yellow")
             text.append(raw, style="yellow")
+        elif "retrying with compacted context" in raw:
+            text.append("♻ ", style="bold yellow")
+            text.append(raw, style="yellow")
         elif "-> EMPTY" in raw:
             text.append("○ ", style="dim yellow")
             text.append(raw, style="dim yellow")
+
+        # 3. LLM stages (planning, decision, wrap_up, grading, claim validation)
+        elif "[Main] planning ->" in raw or "revise_plan" in raw:
+            text.append("🧭 ", style="bold bright_cyan")
+            text.append(raw, style="cyan")
+        elif "[Main] decision" in raw or "[Main] model_call(wrap_up)" in raw:
+            text.append("💭 ", style="bright_blue")
+            text.append(raw, style="bright_white")
+        elif "[Main] evidence_grading" in raw:
+            text.append("⚖️  ", style="bright_yellow")
+            text.append(raw, style="yellow")
+        elif "[Main] conclusion_validation" in raw:
+            text.append("🛡️  ", style="bright_green")
+            text.append(raw, style="green")
+
+        # 4. Repository tools by semantic category
         elif "search_repository" in raw:
             text.append("🔍 ", style="cyan")
+            text.append(raw, style="bright_white")
+        elif "find_files" in raw:
+            text.append("📁 ", style="bright_cyan")
+            text.append(raw, style="white")
+        elif "find_symbol" in raw or "get_ast" in raw:
+            text.append("🧩 ", style="bright_yellow")
+            text.append(raw, style="bright_white")
+        elif any(
+            t in raw
+            for t in ("find_callers", "find_callees", "find_importers", "get_dependencies")
+        ):
+            text.append("🔗 ", style="bright_blue")
             text.append(raw, style="bright_white")
         elif "get_file" in raw or "get_symbol" in raw:
             text.append("📄 ", style="green")
@@ -553,6 +603,8 @@ class RichTerminalUI:
         elif "write_file" in raw or "verify_repository" in raw or "run_command" in raw:
             text.append("🛠  ", style="magenta")
             text.append(raw, style="bright_magenta")
+
+        # 5. Fallback for any custom/future trace line
         else:
             text.append("• ", style="dim cyan")
             text.append(raw, style="dim white")
@@ -611,11 +663,17 @@ class RichTerminalUI:
                 for line in sec_body.splitlines():
                     m = _STEP_BULLET_RE.match(line.strip())
                     if m:
-                        step_id, action, excerpt = m.groups()
-                        table.add_row(f"[{step_id}]", action.strip(), excerpt.strip())
+                        step_id = m.group("step_id")
+                        action = m.group("action")
+                        excerpt = m.group("excerpt")
+                        table.add_row(
+                            escape(f"[{step_id}]"),
+                            escape(action.strip()),
+                            escape(excerpt.strip()),
+                        )
                         any_rows = True
                     elif line.strip():
-                        table.add_row("", "", line.strip().lstrip("- "))
+                        table.add_row("", "", escape(line.strip().lstrip("- ")))
                         any_rows = True
                 if any_rows:
                     self.stdout.print(table)
@@ -630,7 +688,7 @@ class RichTerminalUI:
                 )
             else:
                 self.stdout.print(
-                    Panel(
+                    Panel( # type: ignore
                         Markdown(sec_body),
                         title=f"[bold cyan]{sec_title}[/bold cyan]",
                         border_style="cyan",
