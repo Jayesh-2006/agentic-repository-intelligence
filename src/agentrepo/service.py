@@ -48,7 +48,7 @@ _SECRET_ENV_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 _INLINE_OUTPUT_SECRET_PATTERNS = (
-    (re.compile(r"\bgsk_[A-Za-z0-9]{12,}\b"), "[REDACTED]"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"), "[REDACTED]"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"), "[REDACTED]"),
     (re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._\-+/=]{8,}"), r"\1[REDACTED]"),
     (

@@ -130,7 +130,7 @@ GEMINI_MODEL=gemini-3.5-flash-lite
 GEMINI_TEMPERATURE=0
 ```
 
-`GOOGLE_API_KEY` is also accepted as an alternative API-key variable. Legacy `GROQ_*` variables are retained as fallbacks for migration, but the Gemini settings take precedence.
+`GOOGLE_API_KEY` is also accepted as an alternative API-key variable.
 
 **Keep your API key private. Never commit `.env` or paste secrets into repository questions.**
 

@@ -75,23 +75,21 @@ def load_config(require_api_key: bool = True, env: Mapping[str, str] | None = No
         load_dotenv()  # does not override variables already set in the environment
         env = os.environ
 
-    # Prefer Gemini variables (GEMINI_API_KEY or GOOGLE_API_KEY). GROQ_* aliases
-    # remain supported so older deployments can migrate their .env file smoothly.
+    # Load Gemini API key (GEMINI_API_KEY or GOOGLE_API_KEY).
     api_key = (
         env.get("GEMINI_API_KEY")
         or env.get("GOOGLE_API_KEY")
-        or env.get("GROQ_API_KEY")
         or ""
     ).strip() or None
     if require_api_key and api_key is None:
         raise MissingApiKeyError(
             "GEMINI_API_KEY is not set. Copy .env.example to .env, add your Gemini API key "
             "(https://aistudio.google.com/apikey), or export GEMINI_API_KEY in your shell. "
-            "GOOGLE_API_KEY and legacy GROQ_API_KEY are also accepted."
+            "GOOGLE_API_KEY is also accepted."
         )
 
-    model = (env.get("GEMINI_MODEL") or env.get("GROQ_MODEL") or "").strip() or DEFAULT_MODEL
-    temperature_raw = (env.get("GEMINI_TEMPERATURE") or env.get("GROQ_TEMPERATURE") or "").strip()
+    model = (env.get("GEMINI_MODEL") or "").strip() or DEFAULT_MODEL
+    temperature_raw = (env.get("GEMINI_TEMPERATURE") or "").strip()
     try:
         temperature = float(temperature_raw) if temperature_raw else DEFAULT_TEMPERATURE
     except ValueError:

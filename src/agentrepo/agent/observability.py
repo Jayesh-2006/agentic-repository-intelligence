@@ -22,7 +22,6 @@ _SECRET_KEY_RE = re.compile(
 )
 _INLINE_SECRET_PATTERNS = (
     (re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"), "[REDACTED]"),
-    (re.compile(r"\bgsk_[A-Za-z0-9]{12,}\b"), "[REDACTED]"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"), "[REDACTED]"),
     (re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._\-+/=]{8,}"), r"\1[REDACTED]"),
     (
@@ -180,7 +179,7 @@ def redact_secrets(text: str, api_key: str | None = None) -> str:
         out = str(text or "")
         if api_key and len(api_key.strip()) >= 4:
             out = out.replace(api_key.strip(), "[REDACTED]")
-        for env_var in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GROQ_API_KEY"):
+        for env_var in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
             env_key = os.environ.get(env_var, "").strip()
             if env_key and len(env_key) >= 4:
                 out = out.replace(env_key, "[REDACTED]")
@@ -606,8 +605,6 @@ def extract_model_identity(model: Any) -> dict[str, Any]:
         or "gemini" in cls_name.lower()
     ):
         provider = "google"
-    elif "groq" in mod_name or "groq" in cls_name.lower():
-        provider = "groq"
     elif "openai" in mod_name or "openai" in cls_name.lower():
         provider = "openai"
     elif "anthropic" in mod_name or "anthropic" in cls_name.lower():
