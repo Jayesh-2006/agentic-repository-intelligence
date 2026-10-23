@@ -1,15 +1,4 @@
-"""Structured runtime observability and concise event logging.
-
-This module is strictly instrumentation-only:
-- It never alters model prompts, messages, tool arguments, tool outputs,
-  evidence grading, retry policies, or completion states.
-- It enforces that requests reported as unfittable by context_budget are
-  aborted before sending rather than knowingly sent oversized.
-- All diagnostic emission is wrapped in defensive exception guards so a
-  logging issue can never interrupt execution or cause a call to run twice.
-- Secrets, credentials, and oversized payloads are redacted and bounded
-  before emission.
-"""
+"""Runtime trace context and diagnostic event logging."""
 
 from __future__ import annotations
 

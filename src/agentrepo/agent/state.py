@@ -1,11 +1,4 @@
-"""The agent's LangGraph state: the message history plus a step counter.
-
-When `langchain_core` and `langgraph` are installed, this module re-exports
-their native message, tool, and graph primitives. In minimal test environments
-where only the standard library and Pydantic are installed, lightweight
-compatible fallbacks are provided so unit and integration tests can execute
-the full graph and tool adapters deterministically.
-"""
+"""LangGraph state definitions and message/tool primitives."""
 
 from __future__ import annotations
 

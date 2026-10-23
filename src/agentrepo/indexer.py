@@ -1,7 +1,4 @@
-"""
-Top-level entry point: index_repository(root) walks a directory of Python
-files and returns a RepositoryIndex plus a CodeGraph built from its edges.
-"""
+"""Repository file scanner, Python AST indexer, and text chunk builder."""
 
 from __future__ import annotations
 

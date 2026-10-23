@@ -1,32 +1,4 @@
-"""Deterministic request intent, routing, source-scope enforcement, and capability limits.
-
-An intent is a JSON-safe dictionary:
-
-    {"kind": "explain" | "check" | "audit" | "change",
-     "depth": "minimal" | "standard" | "deep",
-     "rigor": "light" | "standard" | "strict",
-     "answer_style": "short" | "normal" | "detailed",
-     "sources": ["optional/path/to/file", ...],
-     "scope": {"mentioned": [...], "starting_points": [...], "targets": [...], "cross_file": bool}}
-
-`sources` is the ONLY hard read/scope restriction: it is set only when the user
-explicitly limits investigation to particular files, and it is what tool
-authorization enforces across the full repository tool suite. `scope` is
-advisory structure about the files a request merely mentions: a mentioned file
-does not restrict the repository; starting points are where tracing should
-begin; targets are what the user wants explained/inspected/changed; `cross_file`
-says investigation may follow imports, callers and data flow elsewhere. Read
-scope is separate from mutation authorization (`capabilities_for_floor`), which
-never looks at `scope` or `sources`.
-
-The deterministic floor captures explicit user constraints. A planner may
-raise intent values but cannot lower that floor. State readers tolerate
-older or hand-built states without an intent value:
-
-    intent = state.get("intent") or default_intent()
-
-`get_intent(state)` provides this default.
-"""
+"""Request intent classification, source-scope enforcement, and capability bounds."""
 
 from __future__ import annotations
 

@@ -1,19 +1,9 @@
 #!/usr/bin/env python3
-"""
-Streamlit Web UI for Agentic Repository Intelligence (ARI).
-
-Features:
-- Native Windows Explorer folder picker dialog ("📁 Browse...") for selecting local repositories and index folders.
-- Automatic index creation when a specified Saved Index Directory (e.g., `data/RAG`) does not exist yet.
-- Public GitHub repository importer that stores clones in `<project_root>/data/repos/` and indices in `<project_root>/data/indices/`.
-- Subfolder-aware path discovery so this file and `github_importer.py` can live in root or any subdirectory.
-
-Run with:
-    streamlit run streamlit_app.py
-"""
+"""Streamlit Web UI for Agentic Repository Intelligence (ARI)."""
 
 from __future__ import annotations
 
+import html
 import importlib.util
 import logging
 import os
@@ -23,9 +13,13 @@ import subprocess
 import sys
 import threading
 
-import streamlit as st
+try:
+    import streamlit as st
+except ImportError:  # pragma: no cover
+    st = None  # type: ignore[assignment]
 
-# Suppress benign ScriptRunContext warnings from LangGraph/LangChain ThreadPoolExecutor workers
+USER_AVATAR = "assets/user_avatar.jpg"
+
 for _logger_name in (
     "streamlit.runtime.scriptrunner_utils.script_run_context",
     "streamlit.runtime.scriptrunner.script_run_context",
@@ -34,7 +28,6 @@ for _logger_name in (
 
 
 def _find_project_root() -> Path:
-    """Locate the project root directory (containing `src/agentrepo` or `main.py`)."""
     here = Path(__file__).resolve().parent
     for candidate in (here, *here.parents):
         if (
@@ -54,6 +47,9 @@ for _p in (HERE, PROJECT_ROOT, PROJECT_ROOT / "src", PROJECT_ROOT / "scripts"):
         sys.path.insert(0, str(_p))
 
 from agentrepo import index_repository, save_index  # noqa: E402
+from agentrepo.ui_explorer import (  # noqa: E402
+    render_repository_explorer as _ui_render_repository_explorer,
+)
 from agentrepo.agent.app import (  # noqa: E402
     _STEP_BULLET_RE,
     AppError,
@@ -65,8 +61,11 @@ from agentrepo.agent.app import (  # noqa: E402
 )
 
 
+def render_repository_explorer(st_mod, app) -> None:
+    _ui_render_repository_explorer(st_mod, app)
+
+
 def _load_github_importer():
-    """Import `github_importer` regardless of which folder the user placed it in."""
     for mod_name in ("github_importer", "agentrepo.github_importer", "scripts.github_importer"):
         try:
             return __import__(mod_name, fromlist=["import_github_repo"])
@@ -79,10 +78,7 @@ def _load_github_importer():
             sys.modules["github_importer"] = mod
             spec.loader.exec_module(mod)
             return mod
-    raise ImportError(
-        "Could not locate `github_importer.py` in the project. "
-        "Make sure `github_importer.py` is saved in your project folder."
-    )
+    raise ImportError("Could not locate `github_importer.py` in the project.")
 
 
 _gh_mod = _load_github_importer()
@@ -93,7 +89,6 @@ ensure_local_index = getattr(_gh_mod, "ensure_local_index", None)
 DEFAULT_REPOS_DIR = getattr(_gh_mod, "DEFAULT_REPOS_DIR", PROJECT_ROOT / "data" / "repos")
 DEFAULT_INDICES_DIR = getattr(_gh_mod, "DEFAULT_INDICES_DIR", PROJECT_ROOT / "data" / "indices")
 
-
 EXAMPLE_QUERIES = [
     "What is the main purpose of this repository?",
     "What are the main modules and entry points in this repository?",
@@ -103,7 +98,6 @@ EXAMPLE_QUERIES = [
 
 
 def _pick_folder_dialog(title: str = "Select Folder", initial_dir: str = "") -> str | None:
-    """Open a native Windows Explorer / OS folder picker dialog in a dedicated main-thread subprocess."""
     start_dir = initial_dir.strip() if initial_dir and Path(initial_dir.strip()).is_dir() else str(PROJECT_ROOT)
     script = (
         "import sys\n"
@@ -137,7 +131,6 @@ def _pick_folder_dialog(title: str = "Select Folder", initial_dir: str = "") -> 
     except Exception:
         pass
 
-    # Windows PowerShell fallback if tkinter is not installed in the Python build
     if os.name == "nt":
         ps_script = (
             "Add-Type -AssemblyName System.Windows.Forms; "
@@ -163,7 +156,6 @@ def _pick_folder_dialog(title: str = "Select Folder", initial_dir: str = "") -> 
 
 
 def _format_trace_badge(raw: str) -> str:
-    """Attach the same semantic icon badges used in RichTerminalUI."""
     line = (raw or "").strip()
     if not line:
         return ""
@@ -207,7 +199,6 @@ def _format_trace_badge(raw: str) -> str:
 
 
 def _extract_evidence_rows(sec_body: str) -> list[dict[str, str]]:
-    """Parse supporting/reviewed bullet lines into structured table rows."""
     rows: list[dict[str, str]] = []
     for line in (sec_body or "").splitlines():
         stripped = line.strip()
@@ -219,26 +210,434 @@ def _extract_evidence_rows(sec_body: str) -> list[dict[str, str]]:
             step_id = gd.get("step_id") or m.group(1)
             action = gd.get("action") or m.group(2)
             excerpt = gd.get("excerpt") or m.group(3)
-            rows.append(
-                {
-                    "Step": f"[{step_id}]",
-                    "Tool & Location": action.strip(),
-                    "Recorded Excerpt": excerpt.strip(),
-                }
-            )
+            rows.append({
+                "Step": f"[{step_id}]",
+                "Tool & Location": action.strip(),
+                "Recorded Excerpt": excerpt.strip(),
+            })
         else:
-            rows.append(
-                {
-                    "Step": "",
-                    "Tool & Location": "",
-                    "Recorded Excerpt": stripped.lstrip("- "),
-                }
-            )
+            rows.append({
+                "Step": "",
+                "Tool & Location": "",
+                "Recorded Excerpt": stripped.lstrip("- "),
+            })
     return rows
 
 
-def _render_structured_response(answer: str, completion: dict | None, trace_lines: list[str]) -> None:
-    """Render trace log, evidence status badge, Markdown conclusion, and evidence tables."""
+_CRITERION_STATUS_BADGES = {
+    "SUPPORTED": ("✅ PASS (SUPPORTED)", "success"),
+    "PARTIALLY_SUPPORTED": ("🟡 PARTIAL", "warning"),
+    "PARTIAL": ("🟡 PARTIAL", "warning"),
+    "UNSUPPORTED": ("❌ FAIL (UNSUPPORTED)", "error"),
+    "GRADING_FAILED": ("⚠️ GRADING FAILED", "error"),
+    "UNKNOWN": ("❔ UNKNOWN / UNGRADED", "info"),
+    "REMOVED": ("➖ REMOVED", "info"),
+}
+
+
+def _render_runtime_telemetry(completion: dict | None, st_mod=None) -> None:
+    ui = st_mod or st
+    if not isinstance(completion, dict):
+        return
+    telemetry = completion.get("telemetry")
+    if not isinstance(telemetry, dict):
+        return
+
+    total_ms = int(telemetry.get("total_ms", 0))
+    llm_calls = int(telemetry.get("llm_calls", 0))
+    tool_calls = int(telemetry.get("tool_calls", 0))
+    total_tokens = int(telemetry.get("total_tokens", 0))
+    in_tokens = int(telemetry.get("input_tokens", 0))
+    out_tokens = int(telemetry.get("output_tokens", 0))
+    cache_hits = int(telemetry.get("cache_hits", 0))
+    dup_calls = int(telemetry.get("duplicate_tool_calls", 0))
+    rep_blocks = int(telemetry.get("repeated_action_blocks", 0))
+
+    sec_str = f"{total_ms / 1000.0:.2f}s" if total_ms >= 1000 else f"{total_ms}ms"
+    tok_str = f"{total_tokens:,} tok ({in_tokens:,} in / {out_tokens:,} out)" if telemetry.get("token_data") else "tokens n/a"
+
+    pills = [
+        f"⏱️ **{sec_str}**",
+        f"🧠 **{llm_calls}** LLM call{'s' if llm_calls != 1 else ''}",
+        f"🔧 **{tool_calls}** tool call{'s' if tool_calls != 1 else ''}",
+        f"🪙 **{tok_str}**",
+    ]
+    if cache_hits:
+        pills.append(f"⚡ **{cache_hits}** grader cache hit{'s' if cache_hits != 1 else ''}")
+    if rep_blocks:
+        pills.append(f"🛡️ **{rep_blocks}** redundant read{'s' if rep_blocks != 1 else ''} blocked")
+
+    ui.caption("  ·  ".join(pills)) # pyright: ignore[reportOptionalMemberAccess]
+
+    with ui.expander(f"⚡ Runtime Telemetry & Stage Breakdown ({sec_str} · {llm_calls} LLM · {tool_calls} tools)", expanded=False):
+        if hasattr(ui, "columns"):
+            m1, m2, m3, m4 = ui.columns(4)
+            m1.metric("Wall Latency", sec_str)
+            m2.metric("LLM Calls", llm_calls)
+            m3.metric("Tool Executions", f"{tool_calls} ({telemetry.get('tool_ms', 0)} ms)")
+            m4.metric("Total Tokens", f"{total_tokens:,}" if telemetry.get("token_data") else "N/A")
+
+        stages = telemetry.get("stages") or {}
+        if stages:
+            stage_rows = [
+                {
+                    "Agent Stage": stg_name,
+                    "LLM Calls": int(stg_data.get("calls", 0)),
+                    "Input Tokens": int(stg_data.get("input_tokens", 0)),
+                    "Output Tokens": int(stg_data.get("output_tokens", 0)),
+                    "Latency (ms)": int(stg_data.get("latency_ms", 0)),
+                }
+                for stg_name, stg_data in sorted(stages.items())
+                if isinstance(stg_data, dict)
+            ]
+            if stage_rows:
+                ui.markdown("##### 🧠 Per-Stage LLM Breakdown")
+                ui.dataframe(stage_rows, hide_index=True, width="stretch")
+
+        tool_counts = telemetry.get("tool_counts") or {}
+        repo_metrics = telemetry.get("repository_metrics") or {}
+        if tool_counts or repo_metrics:
+            tool_rows = []
+            for t_name, cnt in sorted(tool_counts.items()):
+                r_info = repo_metrics.get(t_name) or {}
+                tool_rows.append({
+                    "Tool / Service Operation": t_name,
+                    "Invocations": cnt,
+                    "Service Latency (ms)": int(r_info.get("latency_ms", 0)),
+                })
+            for r_name, r_info in sorted(repo_metrics.items()):
+                if r_name not in tool_counts:
+                    tool_rows.append({
+                        "Tool / Service Operation": f"service.{r_name}",
+                        "Invocations": int(r_info.get("calls", 0)),
+                        "Service Latency (ms)": int(r_info.get("latency_ms", 0)),
+                    })
+            if tool_rows:
+                ui.markdown("##### 🔧 Tool & Repository Operation Timings")
+                ui.dataframe(tool_rows, hide_index=True, width="stretch")
+
+        if dup_calls or rep_blocks or telemetry.get("deterministic_followups"):
+            ui.caption(
+                f"**Guard & Control Telemetry:** Duplicate calls: `{dup_calls}` · "
+                f"Repeated-read blocks: `{rep_blocks}` · "
+                f"Auto follow-ups: `{len(telemetry.get('deterministic_followups') or [])}`"
+            )
+
+
+def _format_colored_diff_html(unified_diff: str) -> str:
+    if not unified_diff.strip():
+        return '<div class="ari-diff-box"><i>(No line changes)</i></div>'
+    lines_html: list[str] = []
+    for raw_line in unified_diff.splitlines():
+        esc = html.escape(raw_line)
+        if raw_line.startswith("+++") or raw_line.startswith("---"):
+            lines_html.append(f'<div class="ari-diff-hdr">{esc}</div>')
+        elif raw_line.startswith("@@"):
+            lines_html.append(f'<div class="ari-diff-hunk">{esc}</div>')
+        elif raw_line.startswith("+"):
+            lines_html.append(f'<div class="ari-diff-add">{esc}</div>')
+        elif raw_line.startswith("-"):
+            lines_html.append(f'<div class="ari-diff-del">{esc}</div>')
+        else:
+            lines_html.append(f'<div class="ari-diff-ctx">{esc}</div>')
+    body = "".join(lines_html)
+    return f"""
+    <style>
+      .ari-diff-box {{
+        background: #0d131f;
+        border: 1px solid rgba(148, 163, 184, 0.22);
+        border-radius: 10px;
+        padding: 0.65rem 0.85rem;
+        max-height: 420px;
+        overflow-y: auto;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.8rem;
+        line-height: 1.5;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }}
+      .ari-diff-hdr {{ color: #94a3b8; font-weight: 700; }}
+      .ari-diff-hunk {{ color: #38bdf8; background: rgba(56, 189, 248, 0.1); padding: 1px 6px; border-radius: 4px; margin: 2px 0; }}
+      .ari-diff-add {{ color: #4ade80; background: rgba(34, 197, 94, 0.14); padding: 0 6px; border-left: 3px solid #22c55e; }}
+      .ari-diff-del {{ color: #f87171; background: rgba(239, 68, 68, 0.14); padding: 0 6px; border-left: 3px solid #ef4444; }}
+      .ari-diff-ctx {{ color: #cbd5e1; padding: 0 6px; }}
+    </style>
+    <div class="ari-diff-box">{body}</div>
+    """
+
+
+def _render_mutation_diff_card(completion: dict | None, msg_key: str = "live", st_mod=None) -> None:
+    ui = st_mod or st
+    if not isinstance(completion, dict):
+        return
+    mutation = completion.get("mutation")
+    if not isinstance(mutation, dict):
+        return
+
+    file_diffs = [d for d in (mutation.get("file_diffs") or []) if isinstance(d, dict)]
+    changed_files = list(mutation.get("changed_files") or [d.get("file") for d in file_diffs if d.get("file")])
+    if not file_diffs and not changed_files:
+        return
+
+    tx_id = str(mutation.get("tx_id") or msg_key)
+    added_total = int(mutation.get("total_added_lines", 0))
+    removed_total = int(mutation.get("total_removed_lines", 0))
+    auto_rolled_back = bool(mutation.get("rolled_back"))
+    user_decision = mutation.get("user_decision")
+
+    if user_decision == "rolled_back":
+        status_banner = "⏪ **ROLLED BACK BY USER** — Pre-task checkpoint restored and index refreshed."
+        banner_kind = "warning"
+    elif user_decision == "approved":
+        status_banner = "✅ **CHANGES KEPT & APPROVED** — Checkpoint finalized."
+        banner_kind = "success"
+    elif auto_rolled_back:
+        status_banner = "🛡️ **AUTO-ROLLED BACK BY SAFETY ENGINE** — Verification failed; repository restored to pre-task checkpoint."
+        banner_kind = "error"
+    else:
+        status_banner = f"🛠️ **GUARDED MUTATION APPLIED** — {len(changed_files)} file(s) modified (`+{added_total}` / `-{removed_total}` lines)."
+        banner_kind = "info"
+
+    with ui.expander(
+        f"🛡️ Guarded Mutation Diff & Checkpoint Gate ({len(changed_files)} file(s) · +{added_total} / -{removed_total} lines)",
+        expanded=True,
+    ):
+        if banner_kind == "success":
+            ui.success(status_banner)
+        elif banner_kind == "warning":
+            ui.warning(status_banner)
+        elif banner_kind == "error":
+            ui.error(status_banner)
+        else:
+            ui.info(status_banner)
+
+        ui.caption(
+            f"**Transaction:** `{tx_id}` · "
+            f"**Checkpoint:** `{mutation.get('checkpoint_id') or 'snapshot'}` · "
+            f"**Verification State:** `{mutation.get('state') or mutation.get('status')}` · "
+            f"**Repair Attempts:** `{mutation.get('repair_attempts', 0)}`"
+        )
+
+        app = st.session_state.get("ari_app") if st is not None and hasattr(st, "session_state") else None
+        if not auto_rolled_back and user_decision not in ("approved", "rolled_back") and app is not None and hasattr(ui, "columns"):
+            b1, b2 = ui.columns(2)
+            if b1.button("✅ Keep Changes", key=f"keep_mut_{tx_id}_{msg_key}", width="stretch", type="primary"):
+                app.service.approve_mutation_checkpoint(mutation)
+                mutation["user_decision"] = "approved"
+                mutation["can_rollback"] = False
+                if hasattr(st, "toast"):
+                    st.toast("Changes approved and checkpoint finalized!")
+                if hasattr(st, "rerun"):
+                    st.rerun()
+            if b2.button("⏪ Rollback Checkpoint", key=f"rb_mut_{tx_id}_{msg_key}", width="stretch"):
+                rb_res = app.service.apply_mutation_rollback(mutation)
+                if rb_res.get("error"):
+                    ui.error(f"Rollback failed: {rb_res['error']}")
+                else:
+                    mutation["user_decision"] = "rolled_back"
+                    mutation["rolled_back"] = True
+                    mutation["can_rollback"] = False
+                    if hasattr(st, "toast"):
+                        st.toast("Rolled back changes to pre-task checkpoint and refreshed index!")
+                    if hasattr(st, "rerun"):
+                        st.rerun()
+
+        for f_idx, fdiff in enumerate(file_diffs):
+            f_path = str(fdiff.get("file") or f"file_{f_idx}")
+            chg_type = str(fdiff.get("change_type") or "modified").upper()
+            f_add = int(fdiff.get("added_lines", 0))
+            f_rem = int(fdiff.get("removed_lines", 0))
+            ui.markdown(f"**📄 `{f_path}`** (`{chg_type}` · `+{f_add}` / `-{f_rem}` lines)")
+
+            if hasattr(ui, "tabs"):
+                u_tab, sbs_tab = ui.tabs(["Unified Git Diff", "Side-by-Side Comparison"])
+                with u_tab:
+                    diff_html = _format_colored_diff_html(str(fdiff.get("unified_diff") or ""))
+                    if hasattr(ui, "html"):
+                        ui.html(diff_html)
+                    else:
+                        ui.markdown(diff_html, unsafe_allow_html=True)
+                with sbs_tab:
+                    col_before, col_after = ui.columns(2)
+                    lang = Path(f_path).suffix.lstrip(".") or "python"
+                    with col_before:
+                        ui.caption("Before (Checkpoint Snapshot)")
+                        ui.code(str(fdiff.get("before_content") or "(new file — did not exist)"), language=lang, line_numbers=True)
+                    with col_after:
+                        ui.caption("After (Agent Write)")
+                        ui.code(str(fdiff.get("after_content") or "(file deleted)"), language=lang, line_numbers=True)
+            else:
+                ui.code(str(fdiff.get("unified_diff") or ""), language="diff")
+
+
+def _render_acceptance_criteria(completion: dict | None, st_mod=None) -> None:
+    ui = st_mod or st
+    if not isinstance(completion, dict):
+        return
+
+    raw_criteria = completion.get("criteria")
+    raw_initial = completion.get("initial_criteria")
+    removed_criteria = completion.get("removed_criteria") or []
+    summary = completion.get("criteria_summary") if isinstance(completion.get("criteria_summary"), dict) else {}
+
+    criteria_list = [c for c in (raw_criteria or []) if isinstance(c, dict)]
+    initial_list = [c for c in (raw_initial or []) if isinstance(c, dict)]
+
+    c_sup = completion.get("criteria_supported")
+    c_tot = completion.get("criteria_total")
+    if c_sup is None:
+        c_sup = summary.get("supported", sum(1 for c in criteria_list if c.get("satisfied")))
+    if c_tot is None:
+        c_tot = summary.get("total", len(criteria_list))
+
+    if not criteria_list and not initial_list and c_tot is None:
+        return
+
+    any_revised = bool(summary.get("any_revised")) or any(c.get("revised") for c in criteria_list) or bool(removed_criteria)
+    rev_tag = " · 🔄 revised" if any_revised else ""
+    header_ratio = f"{c_sup}/{c_tot} passed" if (c_sup is not None and c_tot is not None) else "status unknown"
+
+    with ui.expander(f"🎯 Acceptance Criteria ({header_ratio}{rev_tag})", expanded=True):
+        source_label = summary.get("source_label") or summary.get("source") or "Standard"
+        part_cnt = summary.get("partially_supported", 0)
+        unsup_cnt = summary.get("unsupported", 0)
+        unk_cnt = summary.get("unknown", 0) + summary.get("grading_failed", 0)
+        init_tot = summary.get("initial_total", len(initial_list) or c_tot or 0)
+
+        summary_bits = [
+            f"**Overall:** `{c_sup}/{c_tot}` passed",
+            f"**Initial Committed:** `{init_tot}`",
+            f"**Final Evaluated:** `{c_tot}`",
+            f"**Source:** `{source_label}`",
+        ]
+        if part_cnt:
+            summary_bits.append(f"**Partial:** `{part_cnt}`")
+        if unsup_cnt:
+            summary_bits.append(f"**Failed / Unsupported:** `{unsup_cnt}`")
+        if unk_cnt:
+            summary_bits.append(f"**Unknown / Grading Failed:** `{unk_cnt}`")
+        ui.caption("  ·  ".join(summary_bits))
+
+        if summary.get("planning_error"):
+            ui.warning(f"**Planning fallback used:** {summary['planning_error']}")
+        if summary.get("grading_failed_flag") or completion.get("support") == "GRADING_FAILED":
+            ui.error("Evidence grading failed or could not complete; criteria could not be verified as satisfied.")
+        if completion.get("validation_status") == "validation_unavailable: rate_limit":
+            ui.warning("Final claim validation was rate-limited; criteria evidence was recorded but final prose claims remain unverified.")
+
+        if criteria_list:
+            overview_rows = []
+            for c in criteria_list:
+                cid = str(c.get("id") or "?")
+                passed = bool(c.get("satisfied"))
+                status_raw = str(c.get("status") or ("SUPPORTED" if passed else "UNSUPPORTED")).upper()
+                badge_label, _ = _CRITERION_STATUS_BADGES.get(status_raw, (status_raw, "info"))
+                ev_ids = [str(x) for x in (c.get("evidence_ids") or []) if isinstance(x, str)]
+                overview_rows.append({
+                    "ID": f"[{cid}]",
+                    "Result": badge_label,
+                    "Acceptance Criterion": str(c.get("description") or ""),
+                    "Evidence Steps": ", ".join(f"[{sid}]" for sid in ev_ids) if ev_ids else "None",
+                })
+            ui.dataframe(overview_rows, hide_index=True, width="stretch")
+
+        if initial_list and (any_revised or len(initial_list) != len(criteria_list)):
+            ui.markdown("##### 🔄 Initial vs. Final Criteria Comparison")
+            comp_rows = []
+            final_by_id = {str(c.get("id")): c for c in criteria_list}
+            seen_ids = set()
+            for ic in initial_list:
+                cid = str(ic.get("id", "?"))
+                seen_ids.add(cid)
+                fc = final_by_id.get(cid)
+                if fc is None:
+                    comp_rows.append({
+                        "ID": f"[{cid}]",
+                        "Change": "➖ REMOVED",
+                        "Initial Criterion (Start of Query)": str(ic.get("description", "")),
+                        "Final Evaluated Criterion": "(removed / superseded)",
+                        "Final Status": "REMOVED",
+                    })
+                else:
+                    chg = str(fc.get("change_type") or ("revised" if fc.get("revised") else "unchanged")).upper()
+                    comp_rows.append({
+                        "ID": f"[{cid}]",
+                        "Change": f"🔄 {chg}" if fc.get("revised") else "✓ UNCHANGED",
+                        "Initial Criterion (Start of Query)": str(ic.get("description", "")),
+                        "Final Evaluated Criterion": str(fc.get("description", "")),
+                        "Final Status": str(fc.get("status") or ("SUPPORTED" if fc.get("satisfied") else "UNSUPPORTED")),
+                    })
+            for fc in criteria_list:
+                cid = str(fc.get("id", "?"))
+                if cid not in seen_ids:
+                    comp_rows.append({
+                        "ID": f"[{cid}]",
+                        "Change": "➕ ADDED",
+                        "Initial Criterion (Start of Query)": "(not in initial plan)",
+                        "Final Evaluated Criterion": str(fc.get("description", "")),
+                        "Final Status": str(fc.get("status") or ("SUPPORTED" if fc.get("satisfied") else "UNSUPPORTED")),
+                    })
+            if comp_rows:
+                ui.dataframe(comp_rows, hide_index=True, width="stretch")
+
+        if not criteria_list and not removed_criteria:
+            ui.info("Detailed per-criterion records were not available for this response.")
+            return
+
+        for c in [*criteria_list, *[r for r in removed_criteria if isinstance(r, dict)]]:
+            cid = str(c.get("id") or "?")
+            status_raw = str(
+                c.get("status")
+                or ("SUPPORTED" if c.get("satisfied") else "UNSUPPORTED")
+            ).upper()
+            badge_label, _ = _CRITERION_STATUS_BADGES.get(status_raw, (status_raw, "info"))
+            rev_label = ""
+            if c.get("revised"):
+                ctype = str(c.get("change_type") or "revised").upper()
+                rev_label = f"  ·  `🔄 {ctype}`"
+
+            desc = str(c.get("description") or "(no description)")
+            init_desc = c.get("initial_description")
+            needed = str(c.get("evidence_needed") or "").strip()
+            explanation = str(c.get("explanation") or c.get("note") or "").strip()
+
+            ui.markdown(f"**`[{cid}]` {badge_label}{rev_label}** — {desc}")
+            if c.get("revised") and isinstance(init_desc, str) and init_desc and init_desc != desc:
+                ui.caption(f"**Initial criterion at query start:** {init_desc}")
+            if c.get("revision_note"):
+                ui.caption(f"**Revision note:** {c['revision_note']}")
+            if needed:
+                ui.caption(f"**Expected evidence:** {needed}")
+            if explanation:
+                ui.caption(f"**Assessment explanation:** {explanation}")
+
+            ev_refs = [r for r in (c.get("evidence_refs") or []) if isinstance(r, dict)]
+            ev_ids = [str(x) for x in (c.get("evidence_ids") or []) if isinstance(x, str)]
+            if ev_refs:
+                ref_rows = [
+                    {
+                        "Step": f"[{ref.get('step_id', '?')}]",
+                        "Tool & Action": ref.get("action") or ref.get("tool") or "",
+                        "Location": ref.get("location") or "",
+                        "Citation Check": "Accepted" if ref.get("accepted", True) else "Rejected by citation check",
+                        "Evidence Excerpt": ref.get("excerpt") or "",
+                    }
+                    for ref in ev_refs
+                ]
+                ui.dataframe(ref_rows, hide_index=True, width="stretch")
+            elif ev_ids:
+                ui.caption("**Supporting step(s):** " + ", ".join(f"`[{sid}]`" for sid in ev_ids))
+            else:
+                ui.caption("**Supporting evidence references:** None recorded for this criterion.")
+
+
+def _render_structured_response(
+    answer: str,
+    completion: dict | None,
+    trace_lines: list[str],
+    *,
+    msg_key: str = "live",
+) -> None:
     if trace_lines:
         with st.expander(f"Execution Trace ({len(trace_lines)} events)", expanded=False):
             st.markdown("  \n".join(_format_trace_badge(t) for t in trace_lines))
@@ -255,8 +654,13 @@ def _render_structured_response(answer: str, completion: dict | None, trace_line
     else:
         st.error(f"**Evidence Status:** `{support}`{ratio}")
 
+    _render_runtime_telemetry(completion)
+
     parsed = parse_structured_answer(answer)
     st.markdown(parsed["conclusion"] or "(No conclusion produced)")
+
+    _render_mutation_diff_card(completion, msg_key=msg_key)
+    _render_acceptance_criteria(completion)
 
     for sec_title, sec_body in parsed["sections"]:
         if sec_title in ("Supporting evidence", "Evidence reviewed but not accepted as support"):
@@ -281,7 +685,6 @@ def _load_active_app(
     auto_create_index: bool = True,
     on_progress=None,
 ) -> None:
-    """Initialize `AgentApp` (building `index_dir` automatically if missing) and store in `st.session_state`."""
     if api_key_override.strip():
         os.environ["GEMINI_API_KEY"] = api_key_override.strip()
 
@@ -330,12 +733,119 @@ def _load_active_app(
     st.session_state["ari_index_dir"] = eff_index
 
 
+def _render_chat_workspace(app, user_input: str | None) -> None:
+    for idx_m, msg in enumerate(st.session_state["messages"]):
+        with st.chat_message(msg["role"], avatar=USER_AVATAR if msg["role"] == "user" else None):
+            if msg["role"] == "user":
+                st.markdown(msg["content"])
+            else:
+                _render_structured_response(
+                    msg["content"],
+                    msg.get("completion"),
+                    msg.get("trace", []),
+                    msg_key=f"hist_{idx_m}",
+                )
+
+    st.caption("Try a focused question; ARI retains multi-turn chat context, grades acceptance criteria, and verifies guarded edits.")
+    cols = st.columns(len(EXAMPLE_QUERIES))
+    triggered_query = None
+    for i, example in enumerate(EXAMPLE_QUERIES):
+        if cols[i].button(example, key=f"ari_example_{i}", width="stretch"):
+            triggered_query = example
+    active_query = triggered_query or user_input
+    if not active_query:
+        return
+
+    prior_history = [
+        {
+            "role": m.get("role", "user"),
+            "content": m.get("content", ""),
+            "completion": m.get("completion"),
+        }
+        for m in st.session_state["messages"]
+        if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content")
+    ]
+    with st.chat_message("user", avatar=USER_AVATAR):
+        st.markdown(active_query)
+    with st.chat_message("assistant"):
+        trace_lines: list[str] = []
+        with st.status("Investigating repository…", expanded=True) as status_box:
+            trace_placeholder = st.empty()
+            event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+            result_holder: dict[str, object] = {}
+
+            def on_trace(line: str) -> None:
+                event_queue.put(("trace", line))
+
+            def _worker() -> None:
+                try:
+                    answer, completion = run_query(
+                        app.agent,
+                        active_query,
+                        on_line=on_trace,
+                        service=app.service,
+                        chat_history=prior_history,
+                    )
+                    result_holder["answer"] = answer
+                    result_holder["completion"] = completion
+                except Exception as exc:
+                    result_holder["error"] = exc
+                finally:
+                    event_queue.put(("done", None))
+
+            worker_thread = threading.Thread(target=_worker, daemon=True)
+            worker_thread.start()
+            while True:
+                kind, payload = event_queue.get()
+                if kind == "trace" and isinstance(payload, str):
+                    trace_lines.append(payload)
+                    trace_placeholder.markdown("  \n".join(_format_trace_badge(line) for line in trace_lines))
+                elif kind == "done":
+                    break
+            worker_thread.join()
+            if "error" in result_holder:
+                status_box.update(label="Investigation failed", state="error", expanded=True)
+                st.error(f"Error: {result_holder['error']}")
+                return
+            answer = str(result_holder.get("answer") or "")
+            completion = result_holder.get("completion")
+            support = completion.get("support", "SUPPORTED") if isinstance(completion, dict) else "SUPPORTED"
+            status_box.update(label=f"Investigation complete · {support}", state="complete", expanded=False)
+        st.session_state["messages"].append({"role": "user", "content": active_query})
+        msg_idx = len(st.session_state["messages"])
+        _render_structured_response(answer, completion, trace_lines, msg_key=f"hist_{msg_idx}")  # type: ignore[arg-type]
+        st.session_state["messages"].append({
+            "role": "assistant", "content": answer, "completion": completion, "trace": trace_lines,
+        })
+
+
 def main() -> None:
     st.set_page_config(
         page_title="ARI — Agentic Repository Intelligence",
         page_icon="🧭",
         layout="wide",
     )
+    st.markdown("""
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
+      :root { --ari-ink: #e8edf7; --ari-muted: #93a0b8; --ari-line: rgba(146,164,197,.16); --ari-accent: #79a9ff; }
+      .stApp { background: radial-gradient(ellipse at 78% -15%, rgba(77,117,191,.16), transparent 34%), #0b1019; color: var(--ari-ink); }
+      html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
+      h1, h2, h3 { font-family: 'Space Grotesk', sans-serif !important; letter-spacing: -.035em; }
+      h1 { font-size: 2.35rem !important; }
+      [data-testid="stSidebar"] { background: #0d1420; border-right: 1px solid var(--ari-line); }
+      [data-testid="stSidebar"] > div { padding-top: 1.5rem; }
+      [data-testid="stMetric"] { background: rgba(21,31,47,.72); border: 1px solid var(--ari-line); border-radius: 14px; padding: 14px 16px; }
+      [data-testid="stMetricLabel"] { color: var(--ari-muted); }
+      [data-testid="stMetricValue"] { font-family: 'Space Grotesk', sans-serif; }
+      [data-testid="stTabs"] button { font-weight: 600; }
+      [data-testid="stChatMessage"] { border: 1px solid var(--ari-line); border-radius: 16px; padding: 1rem; background: rgba(16,24,37,.62); }
+      div[data-testid="stExpander"] { border: 1px solid var(--ari-line); border-radius: 12px; background: rgba(16,24,37,.45); }
+      .ari-eyebrow { color: #8fb6ff; text-transform: uppercase; letter-spacing: .13em; font-size: .72rem; font-weight: 700; }
+      .ari-subtitle { color: var(--ari-muted); margin-top: -.65rem; }
+      div[data-testid="stButton"] button[kind="primary"] { border-radius: 10px; }
+    </style>
+    """, unsafe_allow_html=True)
 
     if "messages" not in st.session_state:
         st.session_state["messages"] = []
@@ -346,7 +856,6 @@ def main() -> None:
     if "local_idx_input" not in st.session_state:
         st.session_state["local_idx_input"] = ""
 
-    # ---------------- Sidebar ----------------
     with st.sidebar:
         st.title("🧭 ARI Controls")
         st.caption("Agentic Repository Intelligence")
@@ -430,7 +939,7 @@ def main() -> None:
                     "Local Repository Path",
                     key="local_repo_input",
                     label_visibility="collapsed",
-                    placeholder=r"D:\projects\RAG\data\repos\vqa_system",
+                    placeholder=r"D:\projects\my-repo",
                 )
             with r_col2:
                 st.button(
@@ -448,7 +957,7 @@ def main() -> None:
                     "Saved Index Directory (optional)",
                     key="local_idx_input",
                     label_visibility="collapsed",
-                    placeholder="e.g. data/RAG (auto-created if missing)",
+                    placeholder="e.g. data/indices/my-repo (auto-created if missing)",
                 )
             with i_col2:
                 st.button(
@@ -479,7 +988,7 @@ def main() -> None:
                             status_box.update(label="Failed to load repository", state="error")
                             st.error(str(exc))
 
-        else:  # Cached Repos
+        else:
             cached = list_cached_repos()
             if not cached:
                 st.info("No cached repositories found in `data/repos/` yet.")
@@ -501,7 +1010,6 @@ def main() -> None:
                         except (AppError, Exception) as exc:
                             st.error(str(exc))
 
-        # Active Repository Status Card
         app = st.session_state.get("ari_app")
         if app is not None:
             st.divider()
@@ -533,110 +1041,44 @@ def main() -> None:
                 st.session_state["messages"] = []
                 st.rerun()
 
-    # ---------------- Main Workspace ----------------
-    st.header("Agentic Repository Intelligence (ARI)")
-
     app = st.session_state.get("ari_app")
     if app is None:
-        st.info(
-            "👈 **Select or import a repository in the sidebar to begin.** "
-            "You can paste any public GitHub URL (e.g., `https://github.com/owner/repo`) "
-            "or click **📁 Browse** under **Local Folder** to pick a folder from Windows Explorer."
-        )
+        st.markdown('<div class="ari-eyebrow">Agentic Repository Intelligence</div>', unsafe_allow_html=True)
+        st.title("Understand your codebase.")
+        st.markdown('<p class="ari-subtitle">Load a repository to ask evidence-backed questions, inspect its structure, and review its indexed source.</p>', unsafe_allow_html=True)
+        st.info("Choose a local folder, public GitHub repository, or cached repository from the sidebar to open your workspace.")
+        st.markdown("**ARI workflow**  \n`Repository` → `AST + text index` → `Retrieval + relationship graph` → `Bounded agent` → `Evidence-backed answer`")
         return
 
-    # Quick-start example query buttons
-    st.caption("Quick test queries:")
-    q_cols = st.columns(len(EXAMPLE_QUERIES))
-    triggered_query: str | None = None
-    for i, eq in enumerate(EXAMPLE_QUERIES):
-        if q_cols[i].button(eq, key=f"eq_{i}", width='stretch'):
-            triggered_query = eq
+    idx = app.service.index
+    repo_name = Path(idx.root).name or idx.root
+    st.markdown('<div class="ari-eyebrow">Repository workspace</div>', unsafe_allow_html=True)
+    st.title(repo_name)
+    st.markdown(f'<p class="ari-subtitle">{idx.root}</p>', unsafe_allow_html=True)
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Python files", len(idx.files))
+    metric_cols[1].metric("Symbols", len(idx.symbols))
+    metric_cols[2].metric("Relationships", len(idx.edges))
+    metric_cols[3].metric("Search chunks", len(idx.chunks))
+    retriever_name = getattr(app.service.retriever, "backend_name", type(app.service.retriever).__name__)
+    st.caption(f"Index: `{st.session_state.get('ari_index_dir') or 'in memory'}`  ·  Retrieval: `{retriever_name}`  ·  Model: `{app.config.model}`")
 
-    # Render conversation history
-    for msg in st.session_state["messages"]:
-        with st.chat_message(msg["role"]):
-            if msg["role"] == "user":
-                st.markdown(msg["content"])
-            else:
-                _render_structured_response(
-                    msg["content"],
-                    msg.get("completion"),
-                    msg.get("trace", []),
-                )
+    workspace = st.radio(
+        "Workspace",
+        options=["Ask ARI", "Explore repository"],
+        horizontal=True,
+        key="ari_workspace",
+        label_visibility="collapsed",
+    )
+    user_input = st.chat_input("Ask ARI about this repository…")
+    if user_input and workspace != "Ask ARI":
+        st.session_state["ari_workspace"] = "Ask ARI"
+        workspace = "Ask ARI"
 
-    user_input = st.chat_input("Ask a question about the repository...")
-    active_query = triggered_query or user_input
-
-    if active_query:
-        st.session_state["messages"].append({"role": "user", "content": active_query})
-        with st.chat_message("user"):
-            st.markdown(active_query)
-
-        with st.chat_message("assistant"):
-            trace_lines: list[str] = []
-            with st.status("Investigating repository...", expanded=True) as status_box:
-                trace_placeholder = st.empty()
-                event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
-                result_holder: dict[str, object] = {}
-
-                # Only enqueue strings from worker threads; never call Streamlit UI methods off the main thread
-                def on_trace(line: str) -> None:
-                    event_queue.put(("trace", line))
-
-                def _worker() -> None:
-                    try:
-                        ans, comp = run_query(
-                            app.agent,
-                            active_query,
-                            on_line=on_trace,
-                            service=app.service,
-                        )
-                        result_holder["answer"] = ans
-                        result_holder["completion"] = comp
-                    except Exception as exc:
-                        result_holder["error"] = exc
-                    finally:
-                        event_queue.put(("done", None))
-
-                worker_thread = threading.Thread(target=_worker, daemon=True)
-                worker_thread.start()
-
-                while True:
-                    kind, payload = event_queue.get()
-                    if kind == "trace" and isinstance(payload, str):
-                        trace_lines.append(payload)
-                        trace_placeholder.markdown(
-                            "  \n".join(_format_trace_badge(t) for t in trace_lines)
-                        )
-                    elif kind == "done":
-                        break
-
-                worker_thread.join()
-
-                if "error" in result_holder:
-                    status_box.update(label="Investigation failed", state="error", expanded=True)
-                    st.error(f"Error: {result_holder['error']}")
-                    return
-
-                answer = str(result_holder.get("answer") or "")
-                completion = result_holder.get("completion")  # type: ignore[assignment]
-                support = (completion or {}).get("support", "SUPPORTED") if isinstance(completion, dict) else "SUPPORTED"
-                status_box.update(
-                    label=f"Investigation complete — {support}",
-                    state="complete",
-                    expanded=False,
-                )
-
-            _render_structured_response(answer, completion, trace_lines) # type: ignore
-            st.session_state["messages"].append(
-                {
-                    "role": "assistant",
-                    "content": answer,
-                    "completion": completion,
-                    "trace": trace_lines,
-                }
-            )
+    if workspace == "Explore repository":
+        render_repository_explorer(st, app)
+    else:
+        _render_chat_workspace(app, user_input)
 
 
 if __name__ == "__main__":

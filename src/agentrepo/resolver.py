@@ -1,12 +1,4 @@
-"""
-Repository-wide resolution.
-
-Collection (collector.py) happens one file at a time and cannot know
-about symbols defined elsewhere. Resolution happens once every file has
-been collected, so it can answer questions like "does this imported name
-actually point at a class in this repo?" or "does this base class's
-method exist somewhere in the inheritance chain?".
-"""
+"""Cross-file symbol, inheritance, import, and call resolution."""
 
 from __future__ import annotations
 

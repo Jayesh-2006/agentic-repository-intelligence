@@ -73,12 +73,22 @@ def print_trace(line: str) -> None:
     _DEFAULT_UI.print_trace(line)
 
 
-def answer_query(app, query: str, ui: RichTerminalUI | None = None) -> None:
+def answer_query(
+    app,
+    query: str,
+    ui: RichTerminalUI | None = None,
+    chat_history: list[dict] | None = None,
+) -> tuple[str, dict | None]:
     active_ui = ui or _DEFAULT_UI
     answer, completion = run_query(
-        app.agent, query, on_line=active_ui.print_trace, service=app.service
+        app.agent,
+        query,
+        on_line=active_ui.print_trace,
+        service=app.service,
+        chat_history=chat_history,
     )
     active_ui.print_answer(answer, completion)
+    return answer, completion
 
 
 def report_error(error: Exception, debug: bool) -> None:
@@ -91,6 +101,7 @@ def report_error(error: Exception, debug: bool) -> None:
 
 def interactive(app, debug: bool, ui: RichTerminalUI | None = None) -> int:
     active_ui = ui or _DEFAULT_UI
+    chat_history: list[dict] = []
     print(
         "Type a question about the repository. Type 'help' for examples, 'status' for index info, or 'exit' to quit.\n",
         flush=True,
@@ -131,7 +142,11 @@ def interactive(app, debug: bool, ui: RichTerminalUI | None = None) -> int:
                 )
             continue
         try:
-            answer_query(app, query, ui=active_ui)
+            ans, comp = answer_query(app, query, ui=active_ui, chat_history=chat_history)
+            from agentrepo.agent.deep_agent import is_usable_conversation_turn
+            if is_usable_conversation_turn(ans, comp):
+                chat_history.append({"role": "user", "content": query})
+                chat_history.append({"role": "assistant", "content": ans, "completion": comp})
         except KeyboardInterrupt:
             print("\nInterrupted.", file=sys.stderr, flush=True)
         except AppError as error:

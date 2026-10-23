@@ -1,11 +1,4 @@
-"""
-A small in-memory graph over code symbols.
-
-Deliberately NOT Neo4j. Just dictionaries of adjacency lists. This is easy
-to persist as JSON, easy to inspect, and easy to explain in an interview:
-"nodes are symbol ids, edges are typed relationships stored both forward
-and backward so lookups in either direction are O(1) average case."
-"""
+"""In-memory bidirectional adjacency-list graph over repository symbols."""
 
 from __future__ import annotations
 

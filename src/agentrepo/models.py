@@ -1,9 +1,4 @@
-"""
-Core data models for the repository intelligence layer.
-
-These are plain dataclasses so they are trivial to explain, serialize to
-JSON, and inspect. No ORM, no database — just structured Python objects.
-"""
+"""Core data models for repository indexing, symbols, edges, and text chunks."""
 
 from __future__ import annotations
 

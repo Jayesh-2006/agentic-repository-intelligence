@@ -1,19 +1,4 @@
-"""Agent construction and public helpers.
-
-The application runs a single primary LangGraph agent (`build_deep_agent`)
-with direct access to repository search, structural analysis, file-reading,
-plan-revision, and guarded modification/verification tools.
-
-    from agentrepo import RepoService
-    from agentrepo.agent import build_deep_agent, final_answer
-
-    agent = build_deep_agent(RepoService.from_repository("path/to/repo"))
-    result = agent.invoke({"messages": [{"role": "user", "content": "Who calls save?"}]})
-    print(final_answer(result["messages"]))
-
-Configuration can be loaded without LangChain; graph dependencies are
-imported when `build_deep_agent` is called.
-"""
+"""Agent construction and public helpers."""
 
 from .config import AgentConfig, ConfigError, MissingApiKeyError, load_config
 from .utils import final_answer

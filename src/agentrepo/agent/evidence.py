@@ -1,16 +1,4 @@
-"""
-Evidence-grounded completion for the Main Agent.
-
-    objective -> acceptance criteria -> steps with evidence
-              -> which criteria the evidence supports -> completion state
-
-All ten read-only repository tools (`search_repository`, `find_files`,
-`find_symbol`, `get_file`, `get_symbol`, `find_callers`, `find_callees`,
-`find_importers`, `get_dependencies`, `get_ast`) as well as guarded mutation
-and verification tools (`write_file`, `verify_repository`, `run_command`)
-produce first-class evidence records with structured provenance, source
-locations, and file/line-range coverage.
-"""
+"""Evidence classification, citation validation, and completion grading."""
 
 from __future__ import annotations
 
@@ -2825,10 +2813,51 @@ def answer_validation_status(answer_check: Optional[dict], plan: Optional[dict] 
     return "passed"
 
 
-def build_completion(support: str, criteria: list[dict], unresolved: str,
-                     answer_check: Optional[dict] = None, plan: Optional[dict] = None,
-                     corpus: str = "") -> dict:
-    """The completion contract."""
+def _build_criterion_evidence_refs(criterion: dict, steps_by_id: dict[str, dict]) -> list[dict]:
+    """Build structured step evidence references for UI inspection of a criterion."""
+    accepted_ids = [str(x) for x in (criterion.get("evidence_ids") or []) if isinstance(x, str)]
+    submitted_ids = [str(x) for x in (criterion.get("grader_evidence_ids") or []) if isinstance(x, str)]
+    ordered_ids = list(dict.fromkeys([*accepted_ids, *submitted_ids]))
+    accepted_set = set(accepted_ids)
+    refs: list[dict] = []
+    for sid in ordered_ids:
+        step = steps_by_id.get(sid) or {}
+        prov = step.get("provenance") or {}
+        loc = ""
+        if prov.get("file"):
+            if prov.get("line_start") and prov.get("line_end"):
+                loc = f"{prov['file']}:{prov['line_start']}-{prov['line_end']}"
+            elif prov.get("line"):
+                loc = f"{prov['file']}:{prov['line']}"
+            else:
+                loc = str(prov["file"])
+        elif prov.get("symbol"):
+            loc = str(prov["symbol"])
+        refs.append({
+            "step_id": sid,
+            "tool": str(step.get("tool") or ""),
+            "action": str(step.get("action") or step.get("tool") or sid),
+            "location": loc,
+            "accepted": sid in accepted_set,
+            "excerpt": _clip(str(step.get("evidence") or ""), 240),
+        })
+    return refs
+
+
+def build_completion(
+    support: str,
+    criteria: list[dict],
+    unresolved: str,
+    answer_check: Optional[dict] = None,
+    plan: Optional[dict] = None,
+    corpus: str = "",
+    *,
+    initial_criteria: Optional[list[dict]] = None,
+    criteria_source: Optional[str] = None,
+    planning_error: Optional[str] = None,
+    mutation: Optional[dict] = None,
+) -> dict:
+    """The completion contract, enriched with per-criterion UI transparency records and mutation diffs."""
     validation = answer_validation_status(answer_check, plan, corpus)
     established = criteria_established(criteria, plan) and not incomplete_reasons(criteria, plan)
     if support == SUPPORTED and not established:
@@ -2842,14 +2871,108 @@ def build_completion(support: str, criteria: list[dict], unresolved: str,
         source = "accepted_claims"
     else:
         source = "criteria_evidence"
-    comp = {"support": support,
-            "criteria_supported": sum(1 for c in criteria if c["satisfied"]),
-            "criteria_total": len(criteria),
-            "unmet": [c["id"] for c in criteria if not c["satisfied"]],
-            "answer_supported": answer_supported,
-            "answer_validation": validation,
-            "answer_source": source,
-            "unresolved": unresolved}
+
+    steps_by_id = {str(s.get("step_id")): s for s in evidence_steps(plan) if s.get("step_id")}
+    init_list = [dict(c) for c in (initial_criteria or criteria) if isinstance(c, dict)]
+    init_by_id = {str(c.get("id")): c for c in init_list}
+
+    enriched_criteria: list[dict] = []
+    any_revised = False
+    for c in criteria:
+        cid = str(c.get("id") or "")
+        init_c = init_by_id.get(cid)
+        init_desc = str(init_c.get("description") or "") if init_c else ""
+        cur_desc = str(c.get("description") or "")
+        revised = bool(c.get("revised")) or (bool(init_c) and init_desc != cur_desc) or (init_c is None and bool(init_list))
+        change_type = str(c.get("change_type") or ("added" if init_c is None and init_list else ("revised" if revised else "unchanged")))
+        if revised:
+            any_revised = True
+
+        note_str = str(c.get("note") or "")
+        if c.get("satisfied"):
+            c_status = "SUPPORTED"
+        elif note_str.startswith(GRADER_FAILED_NOTE) or support == GRADING_FAILED:
+            c_status = "GRADING_FAILED"
+        elif c.get("grader_satisfied") and c.get("validation") == "citation_rejected":
+            c_status = "PARTIALLY_SUPPORTED"
+        elif not c.get("validation") and not note_str:
+            c_status = "UNKNOWN"
+        else:
+            c_status = "UNSUPPORTED"
+
+        ev_refs = _build_criterion_evidence_refs(c, steps_by_id)
+        explanation = note_str or (
+            f"Verified by {len(c.get('evidence_ids') or [])} recorded evidence step(s)."
+            if c.get("satisfied")
+            else "No recorded repository evidence established this criterion."
+        )
+        enriched_criteria.append({
+            **c,
+            "status": c_status,
+            "passed": bool(c.get("satisfied")),
+            "initial_description": init_desc or cur_desc,
+            "revised": revised,
+            "change_type": change_type,
+            "explanation": explanation,
+            "evidence_refs": ev_refs,
+        })
+
+    final_ids = {str(c.get("id")) for c in enriched_criteria}
+    removed_criteria = [
+        {
+            **ic,
+            "status": "REMOVED",
+            "passed": False,
+            "revised": True,
+            "change_type": "removed",
+            "explanation": "Superseded or removed during plan revision.",
+            "evidence_refs": [],
+        }
+        for ic in init_list
+        if str(ic.get("id")) not in final_ids
+    ]
+    if removed_criteria:
+        any_revised = True
+
+    sup_count = sum(1 for c in enriched_criteria if c.get("satisfied"))
+    part_count = sum(1 for c in enriched_criteria if c.get("status") == "PARTIALLY_SUPPORTED")
+    unsup_count = sum(1 for c in enriched_criteria if c.get("status") == "UNSUPPORTED")
+    unk_count = sum(1 for c in enriched_criteria if c.get("status") == "UNKNOWN")
+    gf_count = sum(1 for c in enriched_criteria if c.get("status") == "GRADING_FAILED")
+
+    criteria_summary = {
+        "supported": sup_count,
+        "partially_supported": part_count,
+        "unsupported": unsup_count,
+        "unknown": unk_count,
+        "grading_failed": gf_count,
+        "total": len(enriched_criteria),
+        "initial_total": len(init_list),
+        "any_revised": any_revised,
+        "source": criteria_source or ("fallback" if planning_error else "planner"),
+        "source_label": criteria_source or ("Deterministic Fallback" if planning_error else "Planner LLM"),
+        "planning_error": planning_error,
+        "grading_failed_flag": support == GRADING_FAILED or gf_count > 0,
+    }
+
+    comp = {
+        "support": support,
+        "criteria_supported": sup_count,
+        "criteria_total": len(enriched_criteria),
+        "unmet": [c["id"] for c in criteria if not c["satisfied"]],
+        "answer_supported": answer_supported,
+        "answer_validation": validation,
+        "answer_source": source,
+        "unresolved": unresolved,
+        "criteria": enriched_criteria,
+        "initial_criteria": init_list,
+        "removed_criteria": removed_criteria,
+        "criteria_summary": criteria_summary,
+    }
+    if planning_error:
+        comp["model_error"] = planning_error
+    if mutation is not None:
+        comp["mutation"] = mutation
     if answer_check and (
         answer_check.get("validation_status") == "validation_unavailable: rate_limit"
         or (

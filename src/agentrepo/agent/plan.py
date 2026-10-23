@@ -1,11 +1,4 @@
-"""Structured plan state and transitions for Main Agent invocations.
-
-Plans hold pending and attempted steps in execution order. Plan steps describe
-goals rather than mandatory tool names; direct repository tool calls bind to
-compatible pending steps based on intent and domain/target overlap rather than
-tool-name matching. Revisions replace only pending work, and a monotonic
-sequence keeps step identifiers unique within the invocation.
-"""
+"""Plan state management and step transitions."""
 
 from __future__ import annotations
 

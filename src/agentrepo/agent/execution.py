@@ -1,30 +1,4 @@
-"""
-Explicit execution state for the Main Agent's single-agent orchestration.
-
-This module maintains a structured ledger of every tool action started and
-finished during an invocation: how it bound to the plan, its category
-(read/write/execute), whether it retried an earlier action, whether it
-advanced progress_generation, and what coverage or gaps remain.
-
-Pure functions over plain dicts (no LangChain imports); every helper returns a
-new structure, like plan.py. The ledger records and summarizes; completion
-stays with evidence.py's grading.
-
-Record fields:
-  attempt_id      "attempt_N", monotonic within the invocation
-  step_id         plan step this action was bound to
-  tool_call_id    correlated LLM tool_call id when available
-  binding         "planned" | "ad_hoc" | "automatic"
-  tool, mode      the tool name and category ("direct" | "mutation" | "execution")
-  action_key      normalised tool|argument, used to detect retries
-  retry_of        attempt_id of the latest earlier attempt with the same key
-  generation      progress_generation when it started
-  status          "started" | "ok" | "inconclusive" | "empty" | "failed"
-  productive      True when it produced new information (progress_generation
-                  advanced), False when it did not; None while in flight
-  succeeded       whether its plan step was closed as completed
-  interrupted     False for direct tool execution (retained for schema compatibility)
-"""
+"""Execution ledger and retry/reassessment state tracking."""
 
 from __future__ import annotations
 

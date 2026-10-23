@@ -11,6 +11,8 @@ from .state import AgentState
 class DeepAgentState(AgentState, total=False):
     # Original request text used for routing and capability checks.
     task: str
+    # Prior multi-turn conversation history for resolving follow-up references.
+    conversation_history: list[dict]
 
     # The plan records attempted steps and their evidence.
     plan: Optional[Plan]
@@ -33,6 +35,8 @@ class DeepAgentState(AgentState, total=False):
     # `outcome` describes task execution; `completion` describes evidence support.
     outcome: Optional[str]
     criteria: list[dict]
+    initial_criteria: list[dict]
+    criteria_source: Optional[str]
     completion: Optional[dict]
     completion_retries: int
     completion_retry_progress_generation: Optional[int]

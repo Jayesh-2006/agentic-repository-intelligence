@@ -1,34 +1,4 @@
-"""
-Agent configuration, read from environment variables (and a local .env file).
-
-    GEMINI_API_KEY     required to run the real agent
-    GEMINI_MODEL       default: gemini-3.5-flash-lite
-    GEMINI_TEMPERATURE default: 0
-
-    Legacy GROQ_* variables are accepted as fallbacks for existing .env files.
-    MAX_AGENT_STEPS       default: 8  (max tool-using LLM turns before a forced final answer)
-    MAX_PLAN_STEPS        default: 8  (max steps the upfront planning call may
-                                       propose, and max PENDING steps a revise_plan call may set)
-    MAX_OBSERVATION_CHARS default: 6000  (maximum characters returned per tool observation)
-    MAX_REPAIR_ATTEMPTS   default: 2  (max repair attempts in the modification/verification loop)
-    Hard ceilings: agent iterations 100, plan steps 50, repair attempts 10,
-                   observation characters 100,000, command timeout 300 seconds.
-    VERIFICATION_COMMAND  optional repository-specific verification command
-    COMMAND_TIMEOUT_SECONDS default: 60  (timeout for the automatic verification command)
-    ENABLE_CHECKPOINTS    default: true  (snapshot repository before protected writes/commands and
-                                          roll back failed unrepaired changes on termination)
-    MODEL_CONTEXT_TOKEN_BUDGET default: 6500  (estimated-token budget for ONE model request,
-                                          tool schemas included; older tool observations are
-                                          compacted to fit. Keep it safely below the provider's
-                                          per-request/TPM limit; range 1000-1,000,000. The
-                                          estimate is deliberately conservative - see
-                                          context_budget.py)
-    ROLLBACK_ON_REPAIR_LIMIT default: true  (when an unrepaired change ends in failure,
-                                          restore the repository to its pre-task checkpoint)
-
-This module only requires python-dotenv; it can load configuration without
-LangChain, LangGraph, or an API key.
-"""
+"""Environment-driven agent configuration and validation."""
 
 from __future__ import annotations
 

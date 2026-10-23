@@ -1,11 +1,4 @@
-"""Shared application setup and query execution.
-
-The module loads configuration, opens the indexed repository, builds the
-agent, and runs each query through the Main Agent.
-
-Expected startup and runtime failures are raised as `AppError` with the
-original exception preserved as `__cause__`.
-"""
+"""Application configuration, repository initialization, and query execution."""
 
 from __future__ import annotations
 
@@ -110,9 +103,14 @@ def build_app(service: RepoService, config: AgentConfig, source: str) -> AgentAp
     return AgentApp(agent=agent, service=service, config=config, source=source)
 
 
-def run_query(agent, query: str, on_line: Callable[[str], None] | None = None,
-              service: RepoService | None = None) -> tuple[str, dict | None]:
-    """Run the query through the Main Agent.
+def run_query(
+    agent,
+    query: str,
+    on_line: Callable[[str], None] | None = None,
+    service: RepoService | None = None,
+    chat_history: list[dict] | None = None,
+) -> tuple[str, dict | None]:
+    """Run the query through the Main Agent, optionally with prior multi-turn `chat_history`.
     Returns (response, completion state)."""
     query_started = time.perf_counter()
     service_metrics_before = _service_metrics(service)
@@ -122,10 +120,114 @@ def run_query(agent, query: str, on_line: Callable[[str], None] | None = None,
         if on_line:
             on_line("[Main] run started")
         return _run_query_with_context(
-            agent, query, on_line, service, query_started, service_metrics_before, ctx
+            agent,
+            query,
+            on_line,
+            service,
+            query_started,
+            service_metrics_before,
+            ctx,
+            chat_history=chat_history,
         )
     finally:
         reset_run_context(ctx_token)
+
+
+def _build_runtime_telemetry(
+    query_started: float,
+    messages: list | None = None,
+    node_times: dict[str, float] | None = None,
+    node_counts: dict[str, int] | None = None,
+    planned_steps: int = 0,
+    grader_metrics: dict | None = None,
+    callback=None,
+    repository_metrics: dict | None = None,
+    ctx: RunTraceContext | None = None,
+) -> dict:
+    """Build a structured runtime telemetry dictionary for UI cards and diagnostics."""
+    llm_calls = tool_calls = duplicate_calls = tool_result_chars = 0
+    input_tokens = output_tokens = 0
+    token_data = False
+    tool_counts: dict[str, int] = {}
+    stages: dict[str, dict] = {}
+    tool_ms = 0
+    if callback is not None:
+        llm_calls = callback.llm_calls
+        tool_calls = callback.tool_calls
+        duplicate_calls = callback.duplicate_calls
+        tool_result_chars = callback.tool_result_chars
+        input_tokens = callback.input_tokens
+        output_tokens = callback.output_tokens
+        token_data = callback.token_data
+        tool_counts = dict(callback.tool_counts)
+        stages = {k: dict(v) for k, v in callback.stages.items()}
+        tool_ms = callback.tool_ms
+    else:
+        for message in messages or []:
+            if getattr(message, "type", "") == "tool":
+                tool_result_chars += len(str(getattr(message, "content", "")))
+
+    if ctx is not None:
+        ctx_llm = sum(ctx.agent_llm_calls.values())
+        if ctx_llm > llm_calls:
+            llm_calls = ctx_llm
+        ctx_tools = sum(sum(t.values()) for t in ctx.agent_tool_calls.values())
+        if ctx_tools > tool_calls:
+            tool_calls = ctx_tools
+        if not tool_counts and ctx.agent_tool_calls:
+            tool_counts = {}
+            for by_tool in ctx.agent_tool_calls.values():
+                for t_name, cnt in by_tool.items():
+                    tool_counts[t_name] = tool_counts.get(t_name, 0) + cnt
+        if ctx.stage_details:
+            for stg_key, stg_val in ctx.stage_details.items():
+                short_stg = stg_key.split(":", 1)[-1]
+                if short_stg not in stages:
+                    stages[short_stg] = {
+                        "calls": int(stg_val.get("calls", 0)),
+                        "input_tokens": int(stg_val.get("input_tokens", 0)),
+                        "output_tokens": int(stg_val.get("output_tokens", 0)),
+                        "latency_ms": int(stg_val.get("latency_ms", 0)),
+                    }
+            if not token_data:
+                ctx_in = sum(int(d.get("input_tokens", 0)) for d in ctx.stage_details.values())
+                ctx_out = sum(int(d.get("output_tokens", 0)) for d in ctx.stage_details.values())
+                if ctx_in or ctx_out:
+                    input_tokens, output_tokens = ctx_in, ctx_out
+                    token_data = True
+
+    total_ms = int((time.perf_counter() - query_started) * 1000)
+    gm = dict(grader_metrics or {})
+    cache_hits = int(gm.get("grader_cache_hits", 0)) + int(gm.get("grader_conclusion_cache_hits", 0))
+    cache_misses = int(gm.get("grader_cache_misses", 0))
+    return {
+        "total_ms": total_ms,
+        "llm_calls": llm_calls,
+        "tool_calls": tool_calls,
+        "duplicate_tool_calls": duplicate_calls,
+        "tool_ms": tool_ms,
+        "tool_result_chars": tool_result_chars,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "token_data": token_data,
+        "plan_steps": planned_steps,
+        "stages": stages,
+        "tool_counts": tool_counts,
+        "node_times_ms": {k: int(v) for k, v in (node_times or {}).items()},
+        "node_counts": dict(node_counts or {}),
+        "repository_metrics": {
+            k: {"calls": int(v.get("calls", 0)), "latency_ms": int(v.get("latency_ms", 0))}
+            for k, v in (repository_metrics or {}).items()
+        },
+        "cache_hits": cache_hits,
+        "cache_misses": cache_misses,
+        "grader_metrics": {
+            k: v for k, v in gm.items() if k.startswith(("grader_", "criterion_", "conclusion_"))
+        },
+        "deterministic_followups": list(gm.get("deterministic_followups") or []),
+        "repeated_action_blocks": int(gm.get("repeated_action_blocks", 0)),
+    }
 
 
 def _run_query_with_context(
@@ -136,8 +238,20 @@ def _run_query_with_context(
     query_started: float,
     service_metrics_before: dict,
     ctx: RunTraceContext,
+    *,
+    chat_history: list[dict] | None = None,
 ) -> tuple[str, dict | None]:
     input_state: dict = {"messages": [{"role": "user", "content": query}], "task": query}
+    if chat_history:
+        input_state["conversation_history"] = [
+            {
+                "role": str(m.get("role", "user")),
+                "content": str(m.get("content", "")),
+                "completion": m.get("completion"),
+            }
+            for m in chat_history
+            if isinstance(m, dict) and m.get("content")
+        ]
 
     messages: list = []
     completion = None
@@ -182,6 +296,20 @@ def _run_query_with_context(
         report_metrics(error)
         raise AppError(f"The agent run failed: {error}") from error
     report_metrics()
+    repo_delta = _metric_delta(service_metrics_before, _service_metrics(service))
+    telemetry = _build_runtime_telemetry(
+        query_started=query_started,
+        messages=messages,
+        node_times=node_times,
+        node_counts=node_counts,
+        planned_steps=planned_steps,
+        grader_metrics=grader_metrics,
+        callback=callback,
+        repository_metrics=repo_delta,
+        ctx=ctx,
+    )
+    if isinstance(completion, dict):
+        completion = {**completion, "telemetry": telemetry}
     return final_answer(messages), completion
 
 

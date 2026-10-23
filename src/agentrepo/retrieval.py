@@ -1,14 +1,4 @@
-"""
-Local lexical retrieval over indexed repository chunks using rank-bm25 (BM25Plus).
-
-`Retriever` is the interface the rest of the system depends on. A
-retriever implements `search()` and `rebuild(index)` so RepoService
-can keep it bound to the current index after refresh.
-
-`LexicalRetriever` delegates indexing and scoring directly to `rank_bm25.BM25Plus`
-with a code-aware tokenizer that preserves whole identifiers while splitting
-`snake_case` and `CamelCase` sub-tokens.
-"""
+"""BM25Plus lexical retrieval over indexed repository chunks."""
 
 from __future__ import annotations
 
@@ -37,7 +27,6 @@ DELTA: float = 0.0
 
 
 def tokenize(text: str) -> list[str]:
-    """Keep identifiers whole and also split on snake_case / CamelCase boundaries."""
     tokens: list[str] = []
     for word in _WORD.findall(text):
         whole = word.lower()
@@ -49,7 +38,6 @@ def tokenize(text: str) -> list[str]:
 
 
 def query_tokens(query: str) -> list[str]:
-    """Extract deduplicated, non-stopword query tokens."""
     return list(
         dict.fromkeys(
             t for t in tokenize(query) if t not in _STOPWORDS and len(t) > 1
@@ -64,8 +52,6 @@ class Hit:
 
 
 class Retriever:
-    """Retriever contract: search plus rebuilding against a replacement index."""
-
     def search(self, query: str, top_k: int = 5, file_path: str | None = None) -> list[Hit]:
         raise NotImplementedError
 
@@ -74,8 +60,6 @@ class Retriever:
 
 
 class LexicalRetriever(Retriever):
-    """BM25+ lexical retriever powered directly by rank-bm25."""
-
     backend_name: str = "rank-bm25 (BM25Plus)"
 
     def __init__(self, index: RepositoryIndex) -> None:

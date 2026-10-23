@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-"""
-Public GitHub repository importer and indexer for Agentic Repository Intelligence (ARI).
-
-Key features:
-1. Top-level `os` and `stat` imports with Windows-safe `.git` read-only file removal (`WinError 5` safe).
-2. Shallow cloning via `git clone --depth 1` (fast, minimal bandwidth).
-3. Automatic ZIP archive fallback via GitHub's codeload endpoint if `git` is not installed.
-4. Branch-aware URLs (e.g., https://github.com/owner/repo/tree/main), subpaths, and `owner/repo` shorthand.
-5. Stores cloned repos in `<project_root>/data/repos/<owner>__<repo>` and built indices in
-   `<project_root>/data/indices/<owner>__<repo>`.
-"""
+"""Public GitHub repository importer and indexer for ARI."""
 
 from __future__ import annotations
 

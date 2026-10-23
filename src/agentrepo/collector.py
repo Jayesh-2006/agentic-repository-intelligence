@@ -1,13 +1,4 @@
-"""
-One AST traversal per file.
-
-This module only *collects* — it does not decide what a call resolves to,
-or whether a base class lives in this repo. That decision needs the full,
-repo-wide symbol table, which doesn't exist until every file has been
-walked. So collection (this file) and resolution (resolver.py) are
-deliberately split into two passes over the same data, rather than one
-traversal that duplicates parsing work per relationship type.
-"""
+"""Single-pass Python AST symbol, import, inheritance, and call collector."""
 
 from __future__ import annotations
 

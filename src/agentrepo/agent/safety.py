@@ -1,76 +1,9 @@
-"""
-Deterministic safety, checkpoint, command-mutation protection, repair-limit,
-and rollback policy for repository modifications and command execution in the
-Main Agent.
-
-This module is plain Python control flow (no LLM calls), the same way
-verification.py is: it decides when to create checkpoints, validate command
-safety, detect and roll back unauthorized command mutations, run scoped
-verification, bound repair attempts, roll back failed changes, and refresh the
-repository index, based on objective signals (verification status, repair
-attempt count, changed files, capability grants, and configured policy).
-
-Command Execution Policy Summary:
-  - Both `run_command` and `verify_repository` enforce `validate_command_safety`
-    before any subprocess is created. A blocked command never starts.
-  - Executable identity is verified rather than trusting `basename(argv[0])`:
-      * Relative or path-qualified executables (such as `./python`, `./pytest`,
-        `bin/pytest`, `../pytest`, or `/tmp/pytest`) are denied; only bare
-        allowlisted executable names (resolved against a sanitized `PATH` that
-        excludes `.`, relative entries, and `repo_root`) or the exact current
-        interpreter path `sys.executable` (resolved outside `repo_root`) are
-        permitted.
-      * Script/batch suffixes (`.sh`, `.bat`, `.cmd`, `.ps1`, `.com`, `.py`,
-        `.pl`, `.rb`, `.js`, `.php`, and `.exe` on non-Windows platforms) are
-        rejected on allowlisted binary names so `pytest.sh` or `git.bat` cannot
-        impersonate `pytest` or `git`.
-      * When `python -m <allowlisted_module>` is invoked without `-I` (isolated
-        mode), `validate_command_safety` blocks execution if `repo_root`
-        contains a shadowing `<module>.py`, `<module>/` package,
-        `sitecustomize.py`, or `usercustomize.py`.
-  - Inline code execution (`python -c`, `node -e`, `perl -e`, `ruby -e`,
-    `php -r`, `lua -e`, shell `-c`, etc.), interactive REPL/stdin flags
-    (`python -i`, `python -`), and shell/meta wrappers (`sh`, `bash`, `cmd`,
-    `powershell`, `pwsh`, `env`, `xargs`, `nohup`, `timeout`, `nice`, `sudo`,
-    `find -exec`/`-delete`, etc.) are denied in all modes because arbitrary
-    inline interpreter strings cannot be confined to the repository boundary.
-  - Only an explicit allowlist of repository verification and inspection
-    executables is permitted:
-      * Python (`python`, `python3`, `python3.x`, `py`, `sys.executable`) ONLY
-        with `-m <allowlisted_module>` (`pytest`, `unittest`, `py_compile`,
-        `mypy`, `flake8`, `ruff`), a repository-contained `.py` script path, or
-        `--version` / `--help`.
-      * Direct test/lint runners (`pytest`, `py.test`, `ruff`, `flake8`, `mypy`)
-        with arbitrary plugin-loading (`pytest -p`), type-installation
-        (`mypy --install-types`), and file-writing report flags blocked.
-      * Read-only Git inspection (`git status`, `diff`, `log`, `show`,
-        `rev-parse`, `ls-files`, `blame`, `shortlog`, `describe`) with conservative
-        global/subcommand option parsing (blocking `-c`, `--git-dir`,
-        `--work-tree`, `--exec-path`, `--config-env`, `--bare`, `-p`/`--paginate`,
-        `-o`/`--output`, `--ext-diff`, `--textconv`, `--exec`, `--no-index`).
-      * Read-only repository inspection utilities (`find`, `grep`, `rg`, `ls`,
-        `cat`, `head`, `tail`, `wc`, `diff`, `stat`, `file`) with destructive,
-        symlink-dereferencing (`grep -R`, `rg -L`, `ls -L`, `stat -L`, `file -L`),
-        and external-execution flags blocked.
-  - All path-bearing arguments and option values are canonicalized and checked
-    against `repo_root`, rejecting `..` traversal, `~` expansion, external
-    paths, and symlinks.
-  - Note on security boundary: `subprocess.Popen(..., shell=False)` with
-    command validation, sanitized `PATH` / environment, and repository
-    filesystem checkpoints protects tracked repository files and strips secret
-    environment variables, but is not an OS-level kernel/container sandbox
-    against external side effects if an allowed test runner executes arbitrary
-    code inside the target repository.
-
-Transaction state is serializable (`to_state_dict` / `from_state_dict`) and
-bound per execution step via a `contextvars.ContextVar`, while concurrent
-modifications targeting the same canonical repository root are serialized via
-`RepoService.repo_lock` (`_RepoTransactionLock`) owned by `tx_id`.
-"""
+"""Filesystem checkpointing, command safety validation, repair bounds, and rollback transactions."""
 
 from __future__ import annotations
 
 import contextvars
+import difflib
 import os
 from pathlib import Path
 import posixpath
@@ -1712,6 +1645,7 @@ class MutationTransaction:
         self.checkpoint: Checkpoint | None = None
         self.preserve_checkpoint: bool = False
         self.changed_files: list[str] = []
+        self.file_diffs: dict[str, dict[str, Any]] = {}
         self.repair_attempts: int = 0
         self.in_repair_loop: bool = False
         self.repair_limit_exhausted: bool = False
@@ -1767,6 +1701,7 @@ class MutationTransaction:
             "checkpoint_initialized": self.checkpoint is not None,
             "preserve_checkpoint": self.preserve_checkpoint,
             "changed_files": list(self.changed_files),
+            "file_diffs": dict(self.file_diffs),
             "repair_attempts": self.repair_attempts,
             "in_repair_loop": self.in_repair_loop,
             "repair_limit_exhausted": self.repair_limit_exhausted,
@@ -1814,6 +1749,9 @@ class MutationTransaction:
         tx.changed_files = [
             str(f) for f in (data.get("changed_files") or []) if isinstance(f, str) and f
         ]
+        raw_fdiffs = data.get("file_diffs")
+        if isinstance(raw_fdiffs, dict):
+            tx.file_diffs = {str(k): dict(v) for k, v in raw_fdiffs.items() if isinstance(v, dict)}
         tx.repair_attempts = int(data.get("repair_attempts", 0) or 0)
         tx.in_repair_loop = bool(data.get("in_repair_loop", False))
         tx.repair_limit_exhausted = bool(data.get("repair_limit_exhausted", False))
@@ -1851,6 +1789,76 @@ class MutationTransaction:
             + list(diff.get("added_directories", []))
             + list(diff.get("removed_directories", []))
         )
+
+    def _record_file_diff(
+        self,
+        rel_path: str,
+        *,
+        before_content: str | None,
+        after_content: str | None,
+        existed_before: bool,
+    ) -> None:
+        """Record or update the unified diff and pre-task snapshot for `rel_path`."""
+        norm_path = rel_path.replace("\\", "/")
+        if norm_path in self.file_diffs:
+            orig_before = self.file_diffs[norm_path].get("before_content")
+            orig_existed = bool(self.file_diffs[norm_path].get("existed_before", orig_before is not None))
+        else:
+            orig_before = before_content
+            orig_existed = existed_before
+
+        before_lines = (orig_before or "").splitlines(keepends=True)
+        after_lines = (after_content or "").splitlines(keepends=True)
+        diff_lines = list(
+            difflib.unified_diff(
+                before_lines,
+                after_lines,
+                fromfile=f"a/{norm_path}" if orig_existed else "/dev/null",
+                tofile=f"b/{norm_path}" if after_content is not None else "/dev/null",
+                n=3,
+            )
+        )
+        unified_text = "".join(diff_lines)
+        added_cnt = sum(1 for ln in diff_lines if ln.startswith("+") and not ln.startswith("+++"))
+        removed_cnt = sum(1 for ln in diff_lines if ln.startswith("-") and not ln.startswith("---"))
+        change_type = "added" if not orig_existed else ("deleted" if after_content is None else "modified")
+        self.file_diffs[norm_path] = {
+            "file": norm_path,
+            "change_type": change_type,
+            "existed_before": orig_existed,
+            "before_content": orig_before,
+            "after_content": after_content,
+            "unified_diff": unified_text,
+            "added_lines": added_cnt,
+            "removed_lines": removed_cnt,
+        }
+
+    def build_mutation_summary(self) -> dict[str, Any] | None:
+        """Build a UI-ready summary of guarded file modifications, unified diffs, and rollback state."""
+        if not self.changed_files and not self.file_diffs and not self.last_rollback:
+            return None
+        rolled_back = bool(
+            self.status == "rolled_back"
+            or (isinstance(self.last_rollback, dict) and self.last_rollback.get("rolled_back"))
+        )
+        diffs_list = [self.file_diffs[k] for k in sorted(self.file_diffs)]
+        total_added = sum(int(d.get("added_lines", 0)) for d in diffs_list)
+        total_removed = sum(int(d.get("removed_lines", 0)) for d in diffs_list)
+        return {
+            "tx_id": self.tx_id,
+            "checkpoint_id": self.checkpoint.checkpoint_id if self.checkpoint is not None else None,
+            "status": "rolled_back" if rolled_back else self.status,
+            "state": self.last_state,
+            "changed_files": list(self.changed_files),
+            "file_diffs": diffs_list,
+            "total_added_lines": total_added,
+            "total_removed_lines": total_removed,
+            "repair_attempts": self.repair_attempts,
+            "rolled_back": rolled_back,
+            "rollback": self.last_rollback,
+            "verification": self.last_verification,
+            "can_rollback": bool(diffs_list and not rolled_back),
+        }
 
     def _record_changed_file(
         self, path: str | None = None, extra_files: list[str] | None = None
@@ -2144,6 +2152,17 @@ class MutationTransaction:
         if cp_error is not None:
             return cp_error
 
+        pre_existed = False
+        pre_content: str | None = None
+        try:
+            root_dir = Path(self.service.index.root).resolve()
+            cand_path = (Path(path) if Path(path).is_absolute() else root_dir / path).resolve()
+            if is_within(root_dir, cand_path) and cand_path.is_file() and not cand_path.is_symlink():
+                pre_existed = True
+                pre_content = cand_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
         try:
             raw = self.service.write_file(path, content)
             if "error" in raw:
@@ -2168,6 +2187,12 @@ class MutationTransaction:
 
             written_path = str(raw.get("file") or path)
             self._record_changed_file(written_path)
+            self._record_file_diff(
+                written_path,
+                before_content=pre_content,
+                after_content=content,
+                existed_before=pre_existed,
+            )
             if self.in_repair_loop:
                 self.repair_attempts += 1
 

@@ -1,14 +1,4 @@
-"""
-Repository operations over an index, code graph, and retriever.
-
-Methods return JSON-serialisable dictionaries used by the agent-facing tools.
-
-Errors are returned, not raised, as
-    {"error": {"code": "...", "message": "...", ...extra}}
-so a caller (an LLM agent) can read them and recover. Only expected
-problems are handled this way (bad input, unknown symbol, bad path); real
-bugs still raise normally.
-"""
+"""Repository service layer over the symbol index, code graph, and lexical retriever."""
 
 from __future__ import annotations
 
@@ -1671,6 +1661,78 @@ class RepoService:
             )
         shutil.rmtree(checkpoint["snapshot_dir"], ignore_errors=True)
         return {"checkpoint_id": checkpoint_id, "discarded": True}
+
+    def approve_mutation_checkpoint(self, mutation_info: dict | None) -> dict:
+        """Approve a guarded mutation and discard its temporary checkpoint if still retained."""
+        if not isinstance(mutation_info, dict):
+            return {"approved": False, "error": "invalid mutation info"}
+        cp_id = mutation_info.get("checkpoint_id")
+        if isinstance(cp_id, str) and cp_id:
+            with self._checkpoint_lock:
+                checkpoint = self._checkpoints.pop(cp_id, None)
+            if checkpoint is not None:
+                shutil.rmtree(checkpoint["snapshot_dir"], ignore_errors=True)
+        return {
+            "approved": True,
+            "checkpoint_id": cp_id,
+            "changed_files": list(mutation_info.get("changed_files") or []),
+        }
+
+    def apply_mutation_rollback(self, mutation_info: dict | None) -> dict:
+        """Roll back a guarded mutation either via an active checkpoint or recorded pre-mutation file snapshots."""
+        if not isinstance(mutation_info, dict):
+            return _error("invalid_input", "mutation_info must be a dictionary")
+        cp_id = mutation_info.get("checkpoint_id")
+        if isinstance(cp_id, str) and cp_id:
+            with self._checkpoint_lock:
+                has_cp = cp_id in self._checkpoints
+            if has_cp:
+                rb = self.rollback_to_checkpoint(cp_id)
+                self.discard_checkpoint(cp_id)
+                ref = self.refresh()
+                return {**rb, "refresh": ref, "rolled_back": bool(rb.get("rolled_back", True))}
+
+        file_diffs = mutation_info.get("file_diffs") or []
+        if not file_diffs:
+            return _error("rollback_unavailable", "no checkpoint or file snapshots available to roll back")
+
+        restored_files: list[str] = []
+        removed_files: list[str] = []
+        errors: list[dict] = []
+        with self.transaction_lock():
+            root = Path(self.index.root).resolve()
+            for item in file_diffs:
+                if not isinstance(item, dict):
+                    continue
+                rel_path = str(item.get("file") or "").strip().replace("\\", "/")
+                if not rel_path:
+                    continue
+                target = Path(os.path.abspath(root / rel_path))
+                if not is_within(root, target):
+                    errors.append({"file": rel_path, "error": "path outside repository"})
+                    continue
+                change_type = str(item.get("change_type") or "modified")
+                before_content = item.get("before_content")
+                try:
+                    if change_type == "added" and before_content is None:
+                        if target.is_file() or target.is_symlink():
+                            target.unlink()
+                            removed_files.append(rel_path)
+                    elif isinstance(before_content, str):
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_text(before_content, encoding="utf-8")
+                        restored_files.append(rel_path)
+                except OSError as exc:
+                    errors.append({"file": rel_path, "error": str(exc)})
+            ref = self.refresh()
+        return {
+            "checkpoint_id": cp_id,
+            "restored_files": restored_files,
+            "removed_files": removed_files,
+            "errors": errors,
+            "refresh": ref,
+            "rolled_back": not errors,
+        }
 
     # ------------------------------------------------------------------
     # run_command (verification and command execution primitive, wrapped by

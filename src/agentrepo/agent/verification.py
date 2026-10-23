@@ -1,9 +1,4 @@
-"""Deterministic verification helpers for repository changes and test execution.
-
-Verification is plain Python control flow (not an LLM call): it deterministically
-validates and runs a configured command or scoped syntax check (`RepoService.run_command`,
-always inside the repository root) and classifies pass/fail from its exit code.
-"""
+"""Scoped verification execution and status classification."""
 
 from __future__ import annotations
 

@@ -1,14 +1,4 @@
-"""Single-agent plan-driven orchestration for repository investigation, modification, and debugging.
-
-Each invocation creates an initial plan and acceptance criteria, then loops
-through direct repository tool selection, execution, and state updates within
-configured bounds. The Main Agent has direct access to all ten read-only
-repository tools (including symbol, caller/callee, importer, dependency, and
-AST analysis), plan revision (`revise_plan`), and capability-gated modification
-and verification tools (`write_file`, `verify_repository`, `run_command`).
-Deterministic code enforces permissions, source restrictions, checkpoints,
-scoped verification, bounded repair, rollback, and evidence grading.
-"""
+"""Single-agent LangGraph orchestration for repository investigation and guarded modification."""
 
 from __future__ import annotations
 
@@ -672,24 +662,33 @@ def build_deep_agent(
         planning_error = None
         planning_parse_errors = 0
         criteria: list[dict] = []
+        criteria_source = "Planner LLM"
+        conv_context = _format_conversation_history(state, task)
         model_intent_raw = None
         descriptions: list[str] = []
         readme_for_purpose = _find_readme_path(service) if _is_general_purpose_query(task, intent_floor) else None
-        if readme_for_purpose is not None:
+        if readme_for_purpose is not None and not conv_context:
             model_intent_raw = {"depth": intent_mod.DEPTH_MINIMAL, "rigor": intent_mod.RIGOR_LIGHT}
             descriptions = [f"Read {readme_for_purpose} with get_file to determine the documented project purpose and overview"]
             criteria = ev.default_criteria(task)
-        elif intent_mod.is_lookup_task(task, intent_floor):
+            criteria_source = "Deterministic Baseline (Overview)"
+        elif intent_mod.is_lookup_task(task, intent_floor) and not conv_context:
             model_intent_raw = {"depth": intent_mod.DEPTH_MINIMAL, "rigor": intent_mod.RIGOR_LIGHT}
+            criteria_source = "Deterministic Baseline (Symbol Lookup)"
         else:
             try:
+                plan_payload: dict = {
+                    "objective": task,
+                    "max_steps": config.max_plan_steps,
+                    "max_criteria": ev.MAX_CRITERIA,
+                    "intent_floor": intent_floor,
+                }
+                if conv_context:
+                    plan_payload["conversation_context"] = conv_context
                 reply = invoke_model_logged(
                     llm,
                     [SystemMessage(PLANNING_SYSTEM_PROMPT),
-                     HumanMessage(json.dumps({"objective": task,
-                                              "max_steps": config.max_plan_steps,
-                                              "max_criteria": ev.MAX_CRITERIA,
-                                              "intent_floor": intent_floor}, ensure_ascii=True))],
+                     HumanMessage(json.dumps(plan_payload, ensure_ascii=True))],
                     agent="Main",
                     stage="planning",
                     invoke_config={"metadata": {"ari_stage": "planning"}},
@@ -709,9 +708,12 @@ def build_deep_agent(
             descriptions = [planning.fallback_step_description(task)]
         if not criteria:
             criteria = ev.default_criteria(task)
+            if criteria_source == "Planner LLM":
+                criteria_source = "Deterministic Fallback"
         intent = intent_mod.resolve_intent(task, model_intent_raw, floor=intent_floor)
         descriptions = descriptions[: intent_mod.plan_step_limit(intent, config.max_plan_steps)]
         criteria = criteria[: intent_mod.criteria_limit(intent, ev.MAX_CRITERIA)]
+        initial_criteria = [dict(c) for c in criteria]
         capabilities = intent_mod.capabilities_for_floor(intent_floor)
         seeded_plan = planning.seed_pending_steps(planning.new_plan(task), descriptions)
         log_plan_initialized(seeded_plan, criteria, intent)
@@ -724,6 +726,8 @@ def build_deep_agent(
             "plan": seeded_plan,
             "active_step_ids": {},
             "criteria": criteria,
+            "initial_criteria": initial_criteria,
+            "criteria_source": criteria_source,
             "completion": None,
             "completion_retries": 0,
             "completion_retry_progress_generation": None,
@@ -826,6 +830,8 @@ def build_deep_agent(
         a_cache = assessment_cache if assessment_cache is not None else _assessment_cache_from_state(state)
         c_cache = conclusion_cache if conclusion_cache is not None else _conclusion_cache_from_state(state)
 
+        if tx.changed_files and not tx.in_repair_loop and tx.status == "passed":
+            tx.preserve_checkpoint = True
         final_v_info, final_f_info = tx.finalize_if_unrepaired(termination_reason=termination_reason)
         eff_v_info = final_v_info if final_v_info is not None else state.get("verification_info")
         eff_f_info = final_f_info if final_f_info is not None else state.get("failure_info")
@@ -910,6 +916,7 @@ def build_deep_agent(
             extra_unresolved=extra_unresolved,
             incomplete_reasons_list=ev.incomplete_reasons(criteria, plan),
         )
+        mutation_summary = tx.build_mutation_summary()
         tx_dict = tx.to_state_dict()
         _record_live_tx_state(tx_dict, task=task, concluded=True)
         return {
@@ -923,7 +930,18 @@ def build_deep_agent(
             "verification_info": eff_v_info,
             "failure_info": eff_f_info,
             "final_result": response,
-            "completion": ev.build_completion(support, criteria, unresolved, answer_check, plan, corpus),
+            "completion": ev.build_completion(
+                support,
+                criteria,
+                unresolved,
+                answer_check,
+                plan,
+                corpus,
+                initial_criteria=state.get("initial_criteria"),
+                criteria_source=state.get("criteria_source"),
+                planning_error=state.get("model_error"),
+                mutation=mutation_summary,
+            ),
             "grader_metrics": metrics_local,
             "assessment_cache": a_cache,
             "conclusion_cache": c_cache,
@@ -977,6 +995,11 @@ def build_deep_agent(
             return update
 
         system_messages = [SystemMessage(DEEP_AGENT_SYSTEM_PROMPT)]
+        conv_context = _format_conversation_history(state, task)
+        if conv_context:
+            system_messages.append(
+                HumanMessage("Prior conversation context (for resolving follow-up references):\n" + conv_context)
+            )
         plan_status = planning.describe_plan(plan)
         guidance_status = _describe_investigation_guidance(
             task, intent, plan, state.get("criteria", []), state,
@@ -2538,6 +2561,78 @@ def _model_error_reason(error: Exception, api_key: str | None = None) -> str:
 
 def _task_from_messages(messages: list) -> str:
     return next((str(m.content) for m in reversed(messages) if getattr(m, "type", "") == "human"), "")
+
+
+_FAILED_ANSWER_MARKERS = (
+    "The investigation could not establish the requested result from the recorded evidence.",
+    "The agent stopped because the model request failed:",
+)
+
+
+def is_usable_conversation_turn(answer: str, completion: dict | None = None) -> bool:
+    """Return True only when an assistant turn succeeded without an API/model failure or empty fallback."""
+    txt = (answer or "").strip()
+    if not txt:
+        return False
+    if any(marker in txt for marker in _FAILED_ANSWER_MARKERS):
+        return False
+    if isinstance(completion, dict):
+        if completion.get("model_error"):
+            return False
+        if completion.get("support") in ("UNSUPPORTED", "BLOCKED", "GRADING_FAILED"):
+            return False
+    return True
+
+
+def _format_conversation_history(state: DeepAgentState, active_task: str = "", max_turns: int = 4) -> str:
+    """Format bounded prior conversation turns, excluding failed or unestablished runs."""
+    raw_hist = list(state.get("conversation_history") or [])
+    if not raw_hist:
+        msgs = list(state.get("messages") or [])
+        human_indices = [i for i, m in enumerate(msgs) if getattr(m, "type", "") == "human"]
+        if len(human_indices) > 1:
+            prior_msgs = msgs[: human_indices[-1]]
+            for m in prior_msgs:
+                kind = getattr(m, "type", "")
+                if kind in ("human", "ai") and not getattr(m, "tool_calls", None):
+                    raw_hist.append({
+                        "role": "user" if kind == "human" else "assistant",
+                        "content": _text(getattr(m, "content", "")),
+                    })
+    if not raw_hist:
+        return ""
+
+    # Pair user questions with their corresponding assistant replies and drop failed/orphan turns
+    valid_pairs: list[tuple[str, str]] = []
+    pending_user: str | None = None
+    for item in raw_hist:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").lower()
+        content = str(item.get("content") or "").strip()
+        if not content:
+            continue
+        if role in ("user", "human"):
+            pending_user = content
+        elif role in ("assistant", "ai") and pending_user is not None:
+            comp = item.get("completion") if isinstance(item.get("completion"), dict) else None
+            if is_usable_conversation_turn(content, comp):
+                clean_ans = content.split("\n\nSupporting evidence")[0].split("\n\nEvidence reviewed")[0].strip()
+                if clean_ans.startswith("Conclusion\n"):
+                    clean_ans = clean_ans[len("Conclusion\n") :].strip()
+                if clean_ans and not any(m in clean_ans for m in _FAILED_ANSWER_MARKERS):
+                    u_clip = pending_user if len(pending_user) <= 400 else pending_user[:397] + "..."
+                    a_clip = clean_ans if len(clean_ans) <= 600 else clean_ans[:597] + "..."
+                    valid_pairs.append((u_clip, a_clip))
+            pending_user = None
+
+    if not valid_pairs:
+        return ""
+    lines: list[str] = []
+    for u_txt, a_txt in valid_pairs[-max_turns:]:
+        lines.append(f"- User: {u_txt}")
+        lines.append(f"- Assistant: {a_txt}")
+    return "\n".join(lines)
 
 
 def _text(content) -> str:
