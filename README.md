@@ -225,7 +225,7 @@ Try asking ARI questions such as:
 - `Where is RepoService.refresh defined?`
 - `Who calls index_repository?`
 - `What does collect_module call?`
-- `Which modules import agentrepo.filesystem?`
+- `Which modules import src.repository.filesystem?`
 - `How is path_to_module implemented?`
 - `Where is this configuration value read and used?`
 - `Trace the flow from the entry point to the request handler.`
@@ -234,7 +234,7 @@ Questions that name concrete symbols, files, functions, or behaviors can make it
 
 ## Configuration
 
-Settings are loaded from environment variables and `.env`. See `.env.example` and `src/agentrepo/agent/config.py` for implementation defaults.
+Settings are loaded from environment variables and `.env`. See `.env.example` and `src/agent/config.py` for implementation defaults.
 
 | Variable | Purpose | Default / behavior |
 |---|---|---|
@@ -269,40 +269,12 @@ ari/
 ├── scripts/
 │   └── build_index.py              # Build a reusable repository index
 └── src/
-    └── agentrepo/
-        ├── collector.py            # Repository file collection
-        ├── filesystem.py           # Filesystem operations and safeguards
-        ├── github_importer.py      # Public GitHub repository import
-        ├── graph.py                # Code relationship graph
-        ├── indexer.py              # Index construction
-        ├── models.py               # Core data models
-        ├── module_naming.py        # Module path/name helpers
-        ├── persistence.py          # Index persistence
-        ├── resolver.py              # Symbol and relationship resolution
-        ├── retrieval.py             # Lexical retrieval
-        ├── service.py               # Repository service layer
-        ├── tools.py                 # Repository-facing tools
-        ├── ui_explorer.py           # Explorer support
-        └── agent/
-            ├── app.py               # Agent application assembly
-            ├── config.py             # Runtime configuration
-            ├── context_budget.py     # Model request budget and compaction
-            ├── deep_agent.py         # Main agent workflow
-            ├── deep_state.py         # Agent state
-            ├── evidence.py           # Evidence assessment
-            ├── execution.py          # Execution workflow
-            ├── followups.py          # Follow-up handling
-            ├── intent.py             # Request intent handling
-            ├── json_utils.py         # JSON parsing helpers
-            ├── model.py              # Gemini model setup
-            ├── observability.py      # Concise run events
-            ├── plan.py               # Bounded planning
-            ├── prompts.py             # Agent prompts
-            ├── safety.py              # Safety checks
-            ├── state.py               # Shared state definitions
-            ├── tools.py               # Agent tool definitions
-            ├── utils.py               # Agent utilities
-            └── verification.py        # Verification and repair
+    ├── agent/                      # LangGraph workflow, planning, evidence, and guardrails
+    ├── indexing/                   # Index construction, code graph, models, and persistence
+    ├── query/                      # Query runtime and Gemini model setup
+    ├── repository/                 # Repository service, filesystem helpers, and tools
+    ├── retrieval/                  # Lexical retrieval and ranking
+    └── ui/                         # Repository explorer
 ```
 
 Runtime data such as imported repositories and saved indexes is generated under `data/` and is not part of the source tree.

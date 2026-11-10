@@ -14,9 +14,9 @@ import sys
 from typing import Any, Sequence
 import uuid
 
-from ..filesystem import is_within
-from ..service import RepoService, _split_command, set_current_thread_tx_id
-from .config import AgentConfig
+from ...repository.filesystem import is_within
+from ...repository.service import RepoService, _split_command, set_current_thread_tx_id
+from ..config import AgentConfig
 from .verification import (
     run_scoped_verification,
     run_verification,

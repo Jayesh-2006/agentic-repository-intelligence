@@ -1976,7 +1976,7 @@ def _focused_excerpt(evidence_text: str, objective: str = "", limit: int = _EXCE
     lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
     if len(lines) <= 2 or not objective:
         return _clip(raw, limit)
-    from ..retrieval import query_tokens, tokenize
+    from ..retrieval.lexical import query_tokens, tokenize
     q_terms = set(query_tokens(objective))
     if not q_terms:
         return _clip(raw, limit)

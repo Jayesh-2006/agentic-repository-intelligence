@@ -55,7 +55,7 @@ class DeepAgentState(AgentState, total=False):
     no_progress_count: int
     blocked_read_actions: list[str]
     pending_followup: Optional[dict]
-    model_error: Optional[str]
+    # model_error: Optional[str]
 
     intent: Optional[dict]
     # Derived from the user's request and never upgraded by model output.

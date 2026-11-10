@@ -7,7 +7,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from .filesystem import is_within
+from ..repository.filesystem import is_within
 from .graph import CodeGraph
 from .models import RepositoryIndex, Symbol, Edge, Chunk, FileRecord
 

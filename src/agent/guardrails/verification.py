@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
-from ..service import RepoService
-from .config import AgentConfig
+from ...repository.service import RepoService
+from ..config import AgentConfig
 
 
 def run_verification(

@@ -1,11 +1,7 @@
-#!/usr/bin/env python3
-"""Streamlit Web UI for Agentic Repository Intelligence (ARI)."""
-
 from __future__ import annotations
 
+from dataclasses import replace
 import html
-import importlib.util
-import logging
 import os
 from pathlib import Path
 import queue
@@ -13,44 +9,22 @@ import subprocess
 import sys
 import threading
 
-try:
-    import streamlit as st
-except ImportError:  # pragma: no cover
-    st = None  # type: ignore[assignment]
+import streamlit as st
 
-USER_AVATAR = "assets/user_avatar.jpg"
+PROJECT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
-for _logger_name in (
-    "streamlit.runtime.scriptrunner_utils.script_run_context",
-    "streamlit.runtime.scriptrunner.script_run_context",
-):
-    logging.getLogger(_logger_name).setLevel(logging.ERROR)
-
-
-def _find_project_root() -> Path:
-    here = Path(__file__).resolve().parent
-    for candidate in (here, *here.parents):
-        if (
-            (candidate / "src" / "agentrepo").is_dir()
-            or (candidate / "main.py").is_file()
-            or (candidate / ".env").is_file()
-        ):
-            return candidate
-    return Path.cwd().resolve()
-
-
-HERE = Path(__file__).resolve().parent
-PROJECT_ROOT = _find_project_root()
-
-for _p in (HERE, PROJECT_ROOT, PROJECT_ROOT / "src", PROJECT_ROOT / "scripts"):
-    if _p.is_dir() and str(_p) not in sys.path:
-        sys.path.insert(0, str(_p))
-
-from agentrepo import index_repository, save_index  # noqa: E402
-from agentrepo.ui_explorer import (  # noqa: E402
-    render_repository_explorer as _ui_render_repository_explorer,
+from src.indexing.indexer import index_repository
+from src.indexing.persistence import save_index
+from src.indexing.github_importer import (
+    DEFAULT_INDICES_DIR,
+    ensure_local_index,
+    import_github_repo,
+    list_cached_repos,
 )
-from agentrepo.agent.app import (  # noqa: E402
+from src.agent.observability import redact_secrets
+from src.ui.explorer import render_repository_explorer
+from src.query.app import (
     _STEP_BULLET_RE,
     AppError,
     build_app,
@@ -60,34 +34,8 @@ from agentrepo.agent.app import (  # noqa: E402
     run_query,
 )
 
+USER_AVATAR = str(PROJECT_ROOT / "assets" / "user_avatar.jpg")
 
-def render_repository_explorer(st_mod, app) -> None:
-    _ui_render_repository_explorer(st_mod, app)
-
-
-def _load_github_importer():
-    for mod_name in ("github_importer", "agentrepo.github_importer", "scripts.github_importer"):
-        try:
-            return __import__(mod_name, fromlist=["import_github_repo"])
-        except ImportError:
-            pass
-    for candidate_file in PROJECT_ROOT.rglob("github_importer.py"):
-        spec = importlib.util.spec_from_file_location("github_importer", candidate_file)
-        if spec and spec.loader:
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules["github_importer"] = mod
-            spec.loader.exec_module(mod)
-            return mod
-    raise ImportError("Could not locate `github_importer.py` in the project.")
-
-
-_gh_mod = _load_github_importer()
-GitHubImportError = _gh_mod.GitHubImportError
-import_github_repo = _gh_mod.import_github_repo
-list_cached_repos = _gh_mod.list_cached_repos
-ensure_local_index = getattr(_gh_mod, "ensure_local_index", None)
-DEFAULT_REPOS_DIR = getattr(_gh_mod, "DEFAULT_REPOS_DIR", PROJECT_ROOT / "data" / "repos")
-DEFAULT_INDICES_DIR = getattr(_gh_mod, "DEFAULT_INDICES_DIR", PROJECT_ROOT / "data" / "indices")
 
 EXAMPLE_QUERIES = [
     "What is the main purpose of this repository?",
@@ -183,7 +131,7 @@ def _format_trace_badge(raw: str) -> str:
         return f"⚖️ `{line}`"
     if "[Main] conclusion_validation" in line:
         return f"🛡️ `{line}`"
-    if "search_repository" in line:
+    if line.startswith("[Web]") or "search_repository" in line:
         return f"🔍 `{line}`"
     if "find_files" in line:
         return f"📁 `{line}`"
@@ -256,26 +204,13 @@ def _render_runtime_telemetry(completion: dict | None, st_mod=None) -> None:
     sec_str = f"{total_ms / 1000.0:.2f}s" if total_ms >= 1000 else f"{total_ms}ms"
     tok_str = f"{total_tokens:,} tok ({in_tokens:,} in / {out_tokens:,} out)" if telemetry.get("token_data") else "tokens n/a"
 
-    pills = [
-        f"⏱️ **{sec_str}**",
-        f"🧠 **{llm_calls}** LLM call{'s' if llm_calls != 1 else ''}",
-        f"🔧 **{tool_calls}** tool call{'s' if tool_calls != 1 else ''}",
-        f"🪙 **{tok_str}**",
-    ]
-    if cache_hits:
-        pills.append(f"⚡ **{cache_hits}** grader cache hit{'s' if cache_hits != 1 else ''}")
-    if rep_blocks:
-        pills.append(f"🛡️ **{rep_blocks}** redundant read{'s' if rep_blocks != 1 else ''} blocked")
-
-    ui.caption("  ·  ".join(pills)) # pyright: ignore[reportOptionalMemberAccess]
-
-    with ui.expander(f"⚡ Runtime Telemetry & Stage Breakdown ({sec_str} · {llm_calls} LLM · {tool_calls} tools)", expanded=False):
+    with ui.expander(f"Runtime details ({sec_str} · {llm_calls} model calls · {tool_calls} repository tool calls)"):
         if hasattr(ui, "columns"):
             m1, m2, m3, m4 = ui.columns(4)
             m1.metric("Wall Latency", sec_str)
             m2.metric("LLM Calls", llm_calls)
-            m3.metric("Tool Executions", f"{tool_calls} ({telemetry.get('tool_ms', 0)} ms)")
-            m4.metric("Total Tokens", f"{total_tokens:,}" if telemetry.get("token_data") else "N/A")
+            m3.metric("Repository Tool Calls", f"{tool_calls} ({telemetry.get('tool_ms', 0)} ms)")
+            m4.metric("Total Tokens", f"{total_tokens:,}" if telemetry.get("token_data") else "N/A", help=tok_str)
 
         stages = telemetry.get("stages") or {}
         if stages:
@@ -316,9 +251,9 @@ def _render_runtime_telemetry(completion: dict | None, st_mod=None) -> None:
                 ui.markdown("##### 🔧 Tool & Repository Operation Timings")
                 ui.dataframe(tool_rows, hide_index=True, width="stretch")
 
-        if dup_calls or rep_blocks or telemetry.get("deterministic_followups"):
+        if cache_hits or dup_calls or rep_blocks or telemetry.get("deterministic_followups"):
             ui.caption(
-                f"**Guard & Control Telemetry:** Duplicate calls: `{dup_calls}` · "
+                f"Grader cache hits: `{cache_hits}` · Duplicate calls: `{dup_calls}` · "
                 f"Repeated-read blocks: `{rep_blocks}` · "
                 f"Auto follow-ups: `{len(telemetry.get('deterministic_followups') or [])}`"
             )
@@ -418,7 +353,7 @@ def _render_mutation_diff_card(completion: dict | None, msg_key: str = "live", s
             f"**Repair Attempts:** `{mutation.get('repair_attempts', 0)}`"
         )
 
-        app = st.session_state.get("ari_app") if st is not None and hasattr(st, "session_state") else None
+        app = st.session_state.get("ari_app")
         if not auto_rolled_back and user_decision not in ("approved", "rolled_back") and app is not None and hasattr(ui, "columns"):
             b1, b2 = ui.columns(2)
             if b1.button("✅ Keep Changes", key=f"keep_mut_{tx_id}_{msg_key}", width="stretch", type="primary"):
@@ -497,7 +432,7 @@ def _render_acceptance_criteria(completion: dict | None, st_mod=None) -> None:
     rev_tag = " · 🔄 revised" if any_revised else ""
     header_ratio = f"{c_sup}/{c_tot} passed" if (c_sup is not None and c_tot is not None) else "status unknown"
 
-    with ui.expander(f"🎯 Acceptance Criteria ({header_ratio}{rev_tag})", expanded=True):
+    with ui.expander(f"Acceptance criteria ({header_ratio}{rev_tag})"):
         source_label = summary.get("source_label") or summary.get("source") or "Standard"
         part_cnt = summary.get("partially_supported", 0)
         unsup_cnt = summary.get("unsupported", 0)
@@ -638,42 +573,51 @@ def _render_structured_response(
     *,
     msg_key: str = "live",
 ) -> None:
-    if trace_lines:
-        with st.expander(f"Execution Trace ({len(trace_lines)} events)", expanded=False):
-            st.markdown("  \n".join(_format_trace_badge(t) for t in trace_lines))
-
-    support = (completion or {}).get("support", "SUPPORTED")
-    c_sup = (completion or {}).get("criteria_supported")
-    c_tot = (completion or {}).get("criteria_total")
-    ratio = f" ({c_sup}/{c_tot} criteria)" if c_sup is not None and c_tot is not None else ""
-
-    if support == "SUPPORTED":
-        st.success(f"**Evidence Status:** `{support}`{ratio}")
-    elif support == "PARTIAL":
-        st.warning(f"**Evidence Status:** `{support}`{ratio}")
-    else:
-        st.error(f"**Evidence Status:** `{support}`{ratio}")
-
-    _render_runtime_telemetry(completion)
+    if completion is None:
+        st.markdown(answer or "(No answer produced)")
+        if trace_lines:
+            with st.expander(f"Execution trace ({len(trace_lines)} events)"):
+                st.markdown("  \n".join(_format_trace_badge(line) for line in trace_lines))
+        return
 
     parsed = parse_structured_answer(answer)
+    combined = completion.get("workflow") == "repository_web" or bool(completion.get("public_lookup"))
+    if combined:
+        st.markdown("### Repository findings")
     st.markdown(parsed["conclusion"] or "(No conclusion produced)")
 
-    _render_mutation_diff_card(completion, msg_key=msg_key)
-    _render_acceptance_criteria(completion)
+    support = completion.get("support", "SUPPORTED")
+    c_sup = completion.get("criteria_supported")
+    c_tot = completion.get("criteria_total")
+    ratio = f" ({c_sup}/{c_tot} criteria)" if c_sup is not None and c_tot is not None else ""
 
-    for sec_title, sec_body in parsed["sections"]:
-        if sec_title in ("Supporting evidence", "Evidence reviewed but not accepted as support"):
+    status_color = {"SUPPORTED": "green", "PARTIAL": "orange"}.get(support, "red")
+    scope = "Repository evidence · " if combined else ""
+    st.markdown(f":{status_color}-badge[{scope}{support.replace('_', ' ').title()}{ratio}]")
+
+    _render_mutation_diff_card(completion, msg_key=msg_key)
+
+    sections = sorted(parsed["sections"], key=lambda section: section[0] != "Public background")
+    for sec_title, sec_body in sections:
+        if sec_title == "Public background":
+            st.markdown(f"### {sec_title}\n\n{sec_body}")
+        elif sec_title in ("Supporting evidence", "Evidence reviewed but not accepted as support"):
             rows = _extract_evidence_rows(sec_body)
             if rows:
-                with st.expander(f"📊 {sec_title} ({len(rows)} item(s))", expanded=True):
+                with st.expander(f"{sec_title} ({len(rows)})"):
                     st.dataframe(rows, width='stretch', hide_index=True)
         elif "unresolved" in sec_title.lower() or "unverified" in sec_title.lower():
-            with st.expander(f"⚠️ {sec_title}", expanded=True):
+            with st.expander(sec_title, expanded=support != "SUPPORTED"):
                 st.warning(sec_body)
         else:
-            with st.expander(f"ℹ️ {sec_title}", expanded=False):
+            with st.expander(sec_title):
                 st.markdown(sec_body)
+
+    _render_acceptance_criteria(completion)
+    _render_runtime_telemetry(completion)
+    if trace_lines:
+        with st.expander(f"Execution trace ({len(trace_lines)} events)"):
+            st.markdown("  \n".join(_format_trace_badge(line) for line in trace_lines))
 
 
 def _load_active_app(
@@ -685,9 +629,6 @@ def _load_active_app(
     auto_create_index: bool = True,
     on_progress=None,
 ) -> None:
-    if api_key_override.strip():
-        os.environ["GEMINI_API_KEY"] = api_key_override.strip()
-
     resolved_repo = Path(repo_path.strip()).expanduser()
     if not resolved_repo.is_absolute():
         resolved_repo = (PROJECT_ROOT / resolved_repo).resolve()
@@ -707,7 +648,6 @@ def _load_active_app(
         if not has_files:
             if on_progress is not None:
                 on_progress(f"Building index for {resolved_repo.name} -> {target_idx} ...")
-            target_idx.mkdir(parents=True, exist_ok=True)
             idx_obj, _ = index_repository(resolved_repo)
             save_index(idx_obj, target_idx)
             if on_progress is not None:
@@ -722,15 +662,35 @@ def _load_active_app(
             resolved_idx = _build_if_missing(resolved_idx)
         eff_index = str(resolved_idx)
     elif auto_create_index:
-        resolved_idx = _build_if_missing(DEFAULT_INDICES_DIR / resolved_repo.name)
-        eff_index = str(resolved_idx)
+        default_index = DEFAULT_INDICES_DIR / resolved_repo.name
+        if not default_index.is_relative_to(resolved_repo):
+            eff_index = str(_build_if_missing(default_index))
 
     config = load_app_config(max_steps=max_steps)
+    if api_key_override.strip():
+        config = replace(config, api_key=api_key_override.strip())
     service, source = open_repository(str(resolved_repo), eff_index)
     app = build_app(service, config, source)
+    previous_repo = st.session_state.get("ari_repo_path")
+    if previous_repo and Path(previous_repo) != resolved_repo:
+        histories = st.session_state.setdefault("ari_repo_histories", {})
+        histories[os.path.normcase(previous_repo)] = st.session_state["messages"]
+        st.session_state["messages"] = histories.pop(os.path.normcase(str(resolved_repo)), [])
     st.session_state["ari_app"] = app
     st.session_state["ari_repo_path"] = str(resolved_repo)
     st.session_state["ari_index_dir"] = eff_index
+
+
+def _clear_history_button() -> None:
+    if st.button(
+        "Clear history",
+        key="ari_clear_history",
+        icon=":material/delete:",
+        help="Clear this chat and the context used for follow-up questions.",
+    ):
+        st.session_state["messages"] = []
+        st.toast("Chat history cleared.")
+        st.rerun()
 
 
 def _render_chat_workspace(app, user_input: str | None) -> None:
@@ -738,6 +698,8 @@ def _render_chat_workspace(app, user_input: str | None) -> None:
         with st.chat_message(msg["role"], avatar=USER_AVATAR if msg["role"] == "user" else None):
             if msg["role"] == "user":
                 st.markdown(msg["content"])
+            elif msg.get("error"):
+                st.error(msg["content"])
             else:
                 _render_structured_response(
                     msg["content"],
@@ -746,30 +708,24 @@ def _render_chat_workspace(app, user_input: str | None) -> None:
                     msg_key=f"hist_{idx_m}",
                 )
 
-    st.caption("Try a focused question; ARI retains multi-turn chat context, grades acceptance criteria, and verifies guarded edits.")
-    cols = st.columns(len(EXAMPLE_QUERIES))
     triggered_query = None
-    for i, example in enumerate(EXAMPLE_QUERIES):
-        if cols[i].button(example, key=f"ari_example_{i}", width="stretch"):
-            triggered_query = example
+    if app.service is not None and not st.session_state["messages"]:
+        st.caption("Try asking")
+        cols = st.columns(len(EXAMPLE_QUERIES))
+        for i, example in enumerate(EXAMPLE_QUERIES):
+            if cols[i].button(example, key=f"ari_example_{i}", width="stretch"):
+                triggered_query = example
     active_query = triggered_query or user_input
     if not active_query:
         return
 
-    prior_history = [
-        {
-            "role": m.get("role", "user"),
-            "content": m.get("content", ""),
-            "completion": m.get("completion"),
-        }
-        for m in st.session_state["messages"]
-        if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content")
-    ]
+    prior_history = list(st.session_state["messages"])
     with st.chat_message("user", avatar=USER_AVATAR):
         st.markdown(active_query)
     with st.chat_message("assistant"):
         trace_lines: list[str] = []
-        with st.status("Investigating repository…", expanded=True) as status_box:
+        progress = st.empty()
+        with progress.status("Working on your question…") as status_box:
             trace_placeholder = st.empty()
             event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
             result_holder: dict[str, object] = {}
@@ -804,16 +760,26 @@ def _render_chat_workspace(app, user_input: str | None) -> None:
                     break
             worker_thread.join()
             if "error" in result_holder:
-                status_box.update(label="Investigation failed", state="error", expanded=True)
-                st.error(f"Error: {result_holder['error']}")
+                status_box.update(label="Request failed", state="error", expanded=True)
+                error_message = redact_secrets(str(result_holder["error"]), app.config.api_key)
+                st.error(error_message)
+                st.session_state["messages"].extend([
+                    {"role": "user", "content": active_query},
+                    {
+                        "role": "assistant",
+                        "content": error_message,
+                        "error": True,
+                        "completion": {"support": "BLOCKED"},
+                    },
+                ])
                 return
             answer = str(result_holder.get("answer") or "")
-            completion = result_holder.get("completion")
-            support = completion.get("support", "SUPPORTED") if isinstance(completion, dict) else "SUPPORTED"
-            status_box.update(label=f"Investigation complete · {support}", state="complete", expanded=False)
+            result_completion = result_holder.get("completion")
+            completion = result_completion if isinstance(result_completion, dict) else None
+        progress.empty()
         st.session_state["messages"].append({"role": "user", "content": active_query})
         msg_idx = len(st.session_state["messages"])
-        _render_structured_response(answer, completion, trace_lines, msg_key=f"hist_{msg_idx}")  # type: ignore[arg-type]
+        _render_structured_response(answer, completion, trace_lines, msg_key=f"hist_{msg_idx}")
         st.session_state["messages"].append({
             "role": "assistant", "content": answer, "completion": completion, "trace": trace_lines,
         })
@@ -822,56 +788,27 @@ def _render_chat_workspace(app, user_input: str | None) -> None:
 def main() -> None:
     st.set_page_config(
         page_title="ARI — Agentic Repository Intelligence",
-        page_icon="🧭",
+        page_icon=":material/explore:",
         layout="wide",
     )
-    st.markdown("""
-    <style>
-      @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
-      :root { --ari-ink: #e8edf7; --ari-muted: #93a0b8; --ari-line: rgba(146,164,197,.16); --ari-accent: #79a9ff; }
-      .stApp { background: radial-gradient(ellipse at 78% -15%, rgba(77,117,191,.16), transparent 34%), #0b1019; color: var(--ari-ink); }
-      html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
-      h1, h2, h3 { font-family: 'Space Grotesk', sans-serif !important; letter-spacing: -.035em; }
-      h1 { font-size: 2.35rem !important; }
-      [data-testid="stSidebar"] { background: #0d1420; border-right: 1px solid var(--ari-line); }
-      [data-testid="stSidebar"] > div { padding-top: 1.5rem; }
-      [data-testid="stMetric"] { background: rgba(21,31,47,.72); border: 1px solid var(--ari-line); border-radius: 14px; padding: 14px 16px; }
-      [data-testid="stMetricLabel"] { color: var(--ari-muted); }
-      [data-testid="stMetricValue"] { font-family: 'Space Grotesk', sans-serif; }
-      [data-testid="stTabs"] button { font-weight: 600; }
-      [data-testid="stChatMessage"] { border: 1px solid var(--ari-line); border-radius: 16px; padding: 1rem; background: rgba(16,24,37,.62); }
-      div[data-testid="stExpander"] { border: 1px solid var(--ari-line); border-radius: 12px; background: rgba(16,24,37,.45); }
-      .ari-eyebrow { color: #8fb6ff; text-transform: uppercase; letter-spacing: .13em; font-size: .72rem; font-weight: 700; }
-      .ari-subtitle { color: var(--ari-muted); margin-top: -.65rem; }
-      div[data-testid="stButton"] button[kind="primary"] { border-radius: 10px; }
-    </style>
-    """, unsafe_allow_html=True)
-
-    if "messages" not in st.session_state:
-        st.session_state["messages"] = []
-    if "ari_app" not in st.session_state:
-        st.session_state["ari_app"] = None
-    if "local_repo_input" not in st.session_state:
-        st.session_state["local_repo_input"] = ""
-    if "local_idx_input" not in st.session_state:
-        st.session_state["local_idx_input"] = ""
+    st.session_state.setdefault("messages", [])
 
     with st.sidebar:
-        st.title("🧭 ARI Controls")
-        st.caption("Agentic Repository Intelligence")
+        st.header("Repository")
 
-        source_mode = st.radio(
-            "Repository Source",
+        source_mode = st.selectbox(
+            "Source",
             options=["Public GitHub URL", "Local Folder", "Cached Repos"],
-            horizontal=True,
         )
 
-        max_steps = st.slider("Max Agent Steps", min_value=4, max_value=30, value=14, step=1)
-        api_key_override = st.text_input(
-            "Gemini API Key (optional if in .env)",
-            type="password",
-            placeholder="Uses GEMINI_API_KEY from .env by default",
-        )
+        with st.expander("Model settings"):
+            max_steps = st.slider("Max agent steps", min_value=4, max_value=30, value=14, step=1)
+            api_key_override = st.text_input(
+                "Gemini API key",
+                type="password",
+                placeholder="Optional if configured in .env",
+            )
+            st.caption("Open the repository again to apply changes to an active workspace.")
 
         if source_mode == "Public GitHub URL":
             gh_url = st.text_input(
@@ -880,11 +817,7 @@ def main() -> None:
             )
             gh_branch = st.text_input("Branch (optional)", placeholder="main")
             force_clone = st.checkbox("Force fresh clone & re-index", value=False)
-            st.caption(
-                f"Clones to `{DEFAULT_REPOS_DIR.relative_to(PROJECT_ROOT) if DEFAULT_REPOS_DIR.is_relative_to(PROJECT_ROOT) else DEFAULT_REPOS_DIR}` "
-                f"and indexes to `{DEFAULT_INDICES_DIR.relative_to(PROJECT_ROOT) if DEFAULT_INDICES_DIR.is_relative_to(PROJECT_ROOT) else DEFAULT_INDICES_DIR}`."
-            )
-            if st.button("⬇️ Import & Index GitHub Repo", width='stretch', type="primary"):
+            if st.button("Import repository", icon=":material/download:", width="stretch", type="primary"):
                 if not gh_url.strip():
                     st.error("Please enter a GitHub URL or owner/repo.")
                 else:
@@ -909,7 +842,7 @@ def main() -> None:
                                 expanded=False,
                             )
                             st.rerun()
-                        except (GitHubImportError, AppError, Exception) as exc:
+                        except Exception as exc:
                             status_box.update(label="Import failed", state="error")
                             st.error(str(exc))
 
@@ -921,8 +854,6 @@ def main() -> None:
                 )
                 if picked_dir:
                     st.session_state["local_repo_input"] = picked_dir
-                    if not st.session_state.get("local_idx_input"):
-                        st.session_state["local_idx_input"] = f"data/indices/{Path(picked_dir).name}"
 
             def _on_browse_idx() -> None:
                 picked_idx = _pick_folder_dialog(
@@ -968,7 +899,7 @@ def main() -> None:
                     help="Open Windows Explorer folder dialog",
                 )
 
-            if st.button("📂 Load & Index Local Repository", width='stretch', type="primary"):
+            if st.button("Open local folder", icon=":material/folder_open:", width="stretch", type="primary"):
                 if not local_repo.strip():
                     st.error("Please select or enter a local repository directory path.")
                 else:
@@ -984,7 +915,7 @@ def main() -> None:
                             )
                             status_box.update(label="Repository ready!", state="complete", expanded=False)
                             st.rerun()
-                        except (AppError, Exception) as exc:
+                        except Exception as exc:
                             status_box.update(label="Failed to load repository", state="error")
                             st.error(str(exc))
 
@@ -995,7 +926,7 @@ def main() -> None:
             else:
                 labels = [name for name, _, _ in cached]
                 choice = st.selectbox("Select Cached Repository", options=labels)
-                if st.button("🚀 Open Selected Repo", width='stretch', type="primary"):
+                if st.button("Open cached repository", width="stretch", type="primary"):
                     picked = next(item for item in cached if item[0] == choice)
                     with st.status(f"Opening {choice}...", expanded=False):
                         try:
@@ -1007,77 +938,57 @@ def main() -> None:
                                 auto_create_index=True,
                             )
                             st.rerun()
-                        except (AppError, Exception) as exc:
+                        except Exception as exc:
                             st.error(str(exc))
 
         app = st.session_state.get("ari_app")
         if app is not None:
             st.divider()
-            idx = app.service.index
-            retriever_name = getattr(app.service.retriever, "backend_name", type(app.service.retriever).__name__)
-            st.subheader("📊 Active Repository")
-            st.code(str(idx.root), language=None)
-            if st.session_state.get("ari_index_dir"):
-                st.caption(f"**Index Dir:** `{st.session_state['ari_index_dir']}`")
-            col1, col2 = st.columns(2)
-            col1.metric("Symbols", len(idx.symbols))
-            col2.metric("Chunks", len(idx.chunks))
-            col3, col4 = st.columns(2)
-            col3.metric("Python Files", len(idx.files))
-            col4.metric("Call/Import Edges", len(idx.edges))
-            st.caption(f"**Retriever:** `{retriever_name}`  \n**Model:** `{app.config.model}`")
-
-            b_col1, b_col2 = st.columns(2)
-            if b_col1.button("🔄 Refresh Index", width='stretch'):
+            st.caption(f"Active repository · {Path(app.service.index.root).name}")
+            if st.button("Refresh index", icon=":material/refresh:", width="stretch"):
                 res = app.service.refresh()
                 if "error" in res:
                     st.error(res["error"])
                 else:
-                    if st.session_state.get("ari_index_dir") and ensure_local_index is not None:
-                        ensure_local_index(idx.root, st.session_state["ari_index_dir"], force_rebuild=True)
+                    if st.session_state.get("ari_index_dir"):
+                        ensure_local_index(app.service.index.root, st.session_state["ari_index_dir"], force_rebuild=True)
                     st.toast(f"Re-indexed {res.get('symbol_count')} symbols!")
                     st.rerun()
-            if b_col2.button("🗑️ Clear Chat", width='stretch'):
-                st.session_state["messages"] = []
-                st.rerun()
 
-    app = st.session_state.get("ari_app")
     if app is None:
-        st.markdown('<div class="ari-eyebrow">Agentic Repository Intelligence</div>', unsafe_allow_html=True)
-        st.title("Understand your codebase.")
-        st.markdown('<p class="ari-subtitle">Load a repository to ask evidence-backed questions, inspect its structure, and review its indexed source.</p>', unsafe_allow_html=True)
-        st.info("Choose a local folder, public GitHub repository, or cached repository from the sidebar to open your workspace.")
-        st.markdown("**ARI workflow**  \n`Repository` → `AST + text index` → `Retrieval + relationship graph` → `Bounded agent` → `Evidence-backed answer`")
+        st.title("Ari")
+        st.caption("Agentic Repository Intelligence")
+        st.markdown("Open a local, public GitHub, or cached repository from the sidebar to ask questions and explore its code.")
         return
 
     idx = app.service.index
     repo_name = Path(idx.root).name or idx.root
-    st.markdown('<div class="ari-eyebrow">Repository workspace</div>', unsafe_allow_html=True)
     st.title(repo_name)
-    st.markdown(f'<p class="ari-subtitle">{idx.root}</p>', unsafe_allow_html=True)
+    st.caption(str(idx.root))
     metric_cols = st.columns(4)
-    metric_cols[0].metric("Python files", len(idx.files))
-    metric_cols[1].metric("Symbols", len(idx.symbols))
-    metric_cols[2].metric("Relationships", len(idx.edges))
-    metric_cols[3].metric("Search chunks", len(idx.chunks))
+    metric_cols[0].metric("Python files", len(idx.files), border=True)
+    metric_cols[1].metric("Symbols", len(idx.symbols), border=True)
+    metric_cols[2].metric("Relationships", len(idx.edges), border=True)
+    metric_cols[3].metric("Search chunks", len(idx.chunks), border=True)
     retriever_name = getattr(app.service.retriever, "backend_name", type(app.service.retriever).__name__)
     st.caption(f"Index: `{st.session_state.get('ari_index_dir') or 'in memory'}`  ·  Retrieval: `{retriever_name}`  ·  Model: `{app.config.model}`")
 
-    workspace = st.radio(
+    user_input = st.chat_input("Ask Ari about this repository…")
+    if user_input:
+        st.session_state["ari_workspace"] = "Ask Ari"
+
+    workspace = st.segmented_control(
         "Workspace",
-        options=["Ask ARI", "Explore repository"],
-        horizontal=True,
+        options=["Ask Ari", "Explore repository"],
+        default="Ask Ari" if "ari_workspace" not in st.session_state else None,
         key="ari_workspace",
         label_visibility="collapsed",
     )
-    user_input = st.chat_input("Ask ARI about this repository…")
-    if user_input and workspace != "Ask ARI":
-        st.session_state["ari_workspace"] = "Ask ARI"
-        workspace = "Ask ARI"
 
     if workspace == "Explore repository":
         render_repository_explorer(st, app)
     else:
+        _clear_history_button()
         _render_chat_workspace(app, user_input)
 
 

@@ -157,7 +157,7 @@ def source_allows_path(intent: dict, path: str, service: Any = None) -> bool:
         if isinstance(root_str, str) and root_str:
             from pathlib import Path
             import os
-            from ..filesystem import is_within
+            from ..repository.filesystem import is_within
             try:
                 root = Path(root_str).resolve()
                 unresolved = Path(os.path.abspath(root / norm))

@@ -20,8 +20,8 @@ from typing import Callable, Literal
 from .state import StructuredTool
 from pydantic import BaseModel, Field, ValidationError
 
-from ..service import RepoService
-from ..tools import make_tools, make_verification_tools
+from ..repository.service import RepoService
+from ..repository.tools import make_tools, make_verification_tools
 from . import intent as intent_mod
 from .observability import (
     emit_trace,
@@ -30,7 +30,7 @@ from .observability import (
     log_tool_execution_exception,
     log_tool_execution_start,
 )
-from .safety import FAILED, get_active_execution_scope
+from .guardrails.safety import FAILED, get_active_execution_scope
 from .utils import to_observation
 
 Kind = Literal["module", "class", "function", "method"]

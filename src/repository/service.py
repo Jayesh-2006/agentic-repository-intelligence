@@ -28,11 +28,11 @@ from .filesystem import (
     is_virtualenv_root,
     is_within,
 )
-from .graph import CodeGraph
-from .indexer import index_repository
-from .models import RepositoryIndex, Symbol
-from .persistence import load_index
-from .retrieval import LexicalRetriever, Retriever, query_tokens, tokenize
+from ..indexing.graph import CodeGraph
+from ..indexing.indexer import index_repository
+from ..indexing.models import RepositoryIndex, Symbol
+from ..indexing.persistence import load_index
+from ..retrieval.lexical import LexicalRetriever, Retriever, query_tokens, tokenize
 
 MAX_K = 50
 MAX_FILE_RESULTS = 200

@@ -20,28 +20,15 @@ import urllib.request
 import zipfile
 
 
-def find_project_root() -> Path:
-    """Locate the project root directory regardless of which subfolder this script lives in."""
-    here = Path(__file__).resolve().parent
-    for candidate in (here, *here.parents):
-        if (
-            (candidate / "src" / "agentrepo").is_dir()
-            or (candidate / "main.py").is_file()
-            or (candidate / ".env").is_file()
-        ):
-            return candidate
-    return Path.cwd().resolve()
-
-
-PROJECT_ROOT = find_project_root()
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_REPOS_DIR = PROJECT_ROOT / "data" / "repos"
 DEFAULT_INDICES_DIR = PROJECT_ROOT / "data" / "indices"
 
-for _cand in (PROJECT_ROOT, PROJECT_ROOT / "src"):
-    if _cand.is_dir() and str(_cand) not in sys.path:
-        sys.path.insert(0, str(_cand))
+if not __package__:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-from agentrepo import index_repository, save_index  # noqa: E402
+from src.indexing.indexer import index_repository  # noqa: E402
+from src.indexing.persistence import save_index  # noqa: E402
 
 
 _GITHUB_URL_RE = re.compile(

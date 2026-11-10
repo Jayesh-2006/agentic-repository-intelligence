@@ -100,7 +100,7 @@ def make_verification_tools(service: RepoService) -> dict[str, Callable[..., dic
         way to point it elsewhere), to check whether an implementation works
         (e.g. running a test suite). Returns stdout, stderr and the exit code;
         a command that runs too long is killed and reported as timed out."""
-        from .agent.safety import get_active_execution_scope, validate_command_safety
+        from ..agent.guardrails.safety import get_active_execution_scope, validate_command_safety
 
         scope = get_active_execution_scope()
         write_allowed = bool(scope.write_allowed) if scope is not None else False

@@ -13,7 +13,7 @@ from .module_naming import path_to_module
 from .collector import collect_module, ModuleCollection
 from .resolver import resolve_repository
 from .graph import CodeGraph
-from .filesystem import is_ignored_name, is_ignored_path, is_virtualenv_root
+from ..repository.filesystem import is_ignored_name, is_ignored_path, is_virtualenv_root
 
 # Non-Python files whose text is chunked so search_repository can find it. Every other file
 # (images, archives, unknown types...) is only listed in repo_files.

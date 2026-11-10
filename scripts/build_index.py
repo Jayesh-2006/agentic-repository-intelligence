@@ -9,9 +9,10 @@ chunks.json into out_dir (default: ./data).
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from agentrepo import index_repository, save_index
+from src.indexing.indexer import index_repository
+from src.indexing.persistence import save_index
 
 
 def main() -> None:

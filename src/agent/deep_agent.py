@@ -22,7 +22,7 @@ from .state import (
 )
 from pydantic import BaseModel, Field
 
-from ..service import RepoService
+from ..repository.service import RepoService
 from . import evidence as ev
 from . import execution as execution_mod
 from . import intent as intent_mod
@@ -30,7 +30,7 @@ from . import plan as planning
 from .config import AgentConfig, load_config
 from .deep_state import DeepAgentState
 from .followups import deterministic_followup, result_fingerprint
-from .model import build_llm
+from ..query.model import build_llm
 from .observability import (
     analyze_provider_error,
     ensure_run_context,
@@ -56,7 +56,7 @@ from .prompts import (
     SYNTHESIS_SYSTEM_PROMPT,
     SYNTHESIS_USER_PROMPT,
 )
-from .safety import (
+from .guardrails.safety import (
     FAILED,
     NO_TESTS,
     REPAIR_LIMIT_REACHED,

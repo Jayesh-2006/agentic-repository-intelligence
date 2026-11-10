@@ -3,7 +3,7 @@ The only place that knows which LLM provider is used. The graph just needs
 a LangChain chat model that supports bind_tools().
 """
 
-from .config import AgentConfig
+from ..agent.config import AgentConfig
 
 
 def build_llm(config: AgentConfig):

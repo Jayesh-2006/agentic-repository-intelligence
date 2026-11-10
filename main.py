@@ -22,9 +22,9 @@ import traceback
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE / "src"))
+sys.path.insert(0, str(HERE))
 
-from agentrepo.agent.app import (  # noqa: E402
+from src.query.app import (  # noqa: E402
     AppError, RichTerminalUI, build_app, completion_line, load_app_config, open_repository, run_query,
 )
 
@@ -44,7 +44,7 @@ Example Questions:
   - Where is RepoService.refresh defined?
   - Who calls index_repository?
   - What does collect_module call?
-  - Which modules import agentrepo.filesystem?
+  - Which modules import src.repository.filesystem?
   - How is path_to_module implemented?
   - What is the purpose of this repository?
   - What environment variables are supported?
@@ -143,7 +143,7 @@ def interactive(app, debug: bool, ui: RichTerminalUI | None = None) -> int:
             continue
         try:
             ans, comp = answer_query(app, query, ui=active_ui, chat_history=chat_history)
-            from agentrepo.agent.deep_agent import is_usable_conversation_turn
+            from src.agent.deep_agent import is_usable_conversation_turn
             if is_usable_conversation_turn(ans, comp):
                 chat_history.append({"role": "user", "content": query})
                 chat_history.append({"role": "assistant", "content": ans, "completion": comp})

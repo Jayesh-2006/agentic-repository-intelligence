@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import numpy as np
 from rank_bm25 import BM25Plus
 
-from .models import RepositoryIndex
+from ..indexing.models import RepositoryIndex
 
 _WORD = re.compile(r"[A-Za-z0-9_]+")
 _CAMEL = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")

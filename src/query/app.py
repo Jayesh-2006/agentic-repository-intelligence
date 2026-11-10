@@ -5,21 +5,32 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
+import re
+import sys
 import time
-from typing import Callable
+from typing import Any, Callable
 
-from ..service import RepoService
-from . import build_deep_agent
-from .config import AgentConfig, ConfigError, MissingApiKeyError, load_config
+from langchain_core.callbacks import BaseCallbackHandler
+from rich import box
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.markup import escape
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+from ..repository.service import RepoService
+from ..agent import build_deep_agent
+from ..agent.config import AgentConfig, ConfigError, MissingApiKeyError, load_config
 from .model import build_llm
-from .observability import (
+from ..agent.observability import (
     RunTraceContext,
     format_attribution_metrics,
     format_run_diagnostic_summary,
     reset_run_context,
     start_run_context,
 )
-from .utils import describe_update, final_answer
+from ..agent.utils import describe_update, final_answer
 
 
 class AppError(Exception):
@@ -270,7 +281,7 @@ def _run_query_with_context(
         for chunk in agent.stream(
             input_state,  # type: ignore
             stream_mode="updates",
-            **({"config": {"callbacks": [callback]}} if callback is not None else {}),
+            config={"callbacks": [callback]},
         ):
             chunk_started = time.perf_counter()
             for node, update in chunk.items():
@@ -420,11 +431,6 @@ def _metric_delta(before: dict, after: dict) -> dict:
 
 def _runtime_callback():
     """Collect provider usage and real model/tool timings when available."""
-    try:
-        from langchain_core.callbacks import BaseCallbackHandler
-    except ImportError:
-        return None
-
     class RuntimeCallback(BaseCallbackHandler):
         def __init__(self):
             self._model_starts = {}
@@ -516,25 +522,6 @@ def completion_line(completion: dict) -> str:
 # Rich Terminal UI & Structured Answer Parser
 # ------------------------------------------------------------------
 
-import re
-import sys
-from typing import Any
-
-try:
-    from rich.console import Console
-    from rich.markdown import Markdown
-    from rich.panel import Panel
-    from rich.table import Table
-    from rich.text import Text
-    from rich import box
-    from rich.markup import escape
-
-    RICH_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    RICH_AVAILABLE = False
-    Console = None  # type: ignore
-    escape = lambda s: s  # type: ignore
-
 _SECTION_HEADERS = (
     "Conclusion",
     "Confirmed findings",
@@ -610,8 +597,8 @@ class RichTerminalUI:
     # pyright: ignore[reportMissingTypeStubs]
 
     def __init__(self, *, use_rich: bool = True) -> None:
-        self.enabled = bool(use_rich and RICH_AVAILABLE)
-        self.stdout = Console(soft_wrap=False) if self.enabled else None # pyright: ignore[reportOptionalCall]
+        self.enabled = use_rich
+        self.stdout = Console(soft_wrap=False) if self.enabled else None
         self.stderr = Console(stderr=True, soft_wrap=False) if self.enabled else None
 
     def print_banner(

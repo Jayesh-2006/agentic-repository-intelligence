@@ -9,7 +9,7 @@ import os
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .filesystem import IGNORED_DIRS, is_ignored_name, is_virtualenv_root, is_within
+from ..repository.filesystem import IGNORED_DIRS, is_ignored_name, is_virtualenv_root, is_within
 
 _FILE_VIEWER_MAX_BYTES = 8 * 1024 * 1024
 _FILE_READ_CHUNK_LINES = 5000
