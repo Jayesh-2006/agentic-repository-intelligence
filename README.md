@@ -4,8 +4,6 @@
 
 ARI combines static Python analysis, lexical retrieval, a repository relationship graph, and a bounded LangGraph agent in one workflow. Use it from the terminal or through a Streamlit interface to understand unfamiliar codebases, investigate dependencies, and explore implementation details without manually searching every file.
 
-> **Project status:** Research / portfolio project. Review generated answers and proposed changes before relying on them in production.
-
 ## Highlights
 
 - **Repository-aware Q&A** — ask natural-language questions about implementation, architecture, configuration, and behavior.
