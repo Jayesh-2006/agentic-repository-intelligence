@@ -130,8 +130,6 @@ GEMINI_TEMPERATURE=0
 
 `GOOGLE_API_KEY` is also accepted as an alternative API-key variable.
 
-**Keep your API key private. Never commit `.env` or paste secrets into repository questions.**
-
 ## Usage
 
 ARI provides a command-line interface and a Streamlit interface.
@@ -176,7 +174,7 @@ You can ask multiple questions in the `Query >` prompt.
 | `--plain` | Disable Rich terminal formatting |
 | `--debug` | Print full tracebacks for errors |
 
-Without `--index-dir`, ARI indexes the selected repository in memory. Re-index after repository changes so answers reflect the latest source.
+Without `--index-dir`, ARI indexes the selected repository in memory.
 
 ### Option B — Streamlit UI
 
@@ -213,7 +211,7 @@ python main.py \
   --query "Where is the request handled?"
 ```
 
-If the source repository changes, rebuild the saved index before querying it again.
+Saved indexes reflect the repository at the time they were built.
 
 ## Example questions
 
@@ -227,8 +225,6 @@ Try asking ARI questions such as:
 - `How is path_to_module implemented?`
 - `Where is this configuration value read and used?`
 - `Trace the flow from the entry point to the request handler.`
-
-Questions that name concrete symbols, files, functions, or behaviors can make it easier to retrieve specific evidence.
 
 ## Configuration
 
@@ -250,7 +246,7 @@ Settings are loaded from environment variables and `.env`. See `.env.example` an
 | `ROLLBACK_ON_REPAIR_LIMIT` | Roll back unrepaired changes when the repair limit is reached | `true` |
 | `MODEL_CONTEXT_TOKEN_BUDGET` | Estimated token budget per model request, including tool schemas | Configurable; see `config.py` |
 
-Boolean settings accept common values such as `true`/`false`, `1`/`0`, `yes`/`no`, and `on`/`off`. Keep checkpointing and rollback enabled when experimenting with repository modifications.
+Boolean settings accept common values such as `true`/`false`, `1`/`0`, `yes`/`no`, and `on`/`off`.
 
 ## Project structure
 
@@ -276,47 +272,3 @@ ari/
 ```
 
 Runtime data such as imported repositories and saved indexes is generated under `data/` and is not part of the source tree.
-
-## Safety, verification, and limitations
-
-ARI includes safeguards, but they do **not** make arbitrary code execution or automated edits risk-free.
-
-- Keep `ENABLE_CHECKPOINTS=true` and `ROLLBACK_ON_REPAIR_LIMIT=true` for modification workflows.
-- Review changes and commands before relying on them; use Git or another backup mechanism for important repositories.
-- Verification is only as strong as the configured checks. Passing a syntax check does not establish functional correctness.
-- Rollback behavior depends on the mutation path, checkpoint coverage, and configured failure conditions. Do not treat it as a substitute for version control.
-- Python AST analysis cannot completely resolve dynamic dispatch, runtime-generated calls, or every framework convention.
-- Non-Python files may be indexed as text but do not receive the same AST-level analysis.
-- Retrieval can miss relevant context, especially when the index is stale. Refresh or rebuild indexes after source changes.
-- The GitHub importer is intended for public repositories. Do not provide private credentials or secrets to the agent.
-
-## Troubleshooting
-
-**ARI reports a missing API key**
-
-- Check that `.env` exists in the project root and contains `GEMINI_API_KEY=...`.
-- Alternatively, set `GOOGLE_API_KEY`.
-- Restart the CLI or Streamlit process after changing environment variables.
-
-**Answers do not reflect recent code changes**
-
-- Use `refresh` in CLI interactive mode.
-- If using a saved index, rebuild it with `scripts/build_index.py`.
-- Reload or re-index the repository in the Streamlit UI.
-
-**Dependency or import errors**
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-Confirm that the virtual environment is active and commands are run from the project root.
-
-**Model timeout, overload, or rate-limit errors**
-
-- Retry after a short wait; provider availability and limits can vary.
-- Reduce `MAX_AGENT_STEPS` or `MAX_PLAN_STEPS` to limit agent work.
-- Lower `MODEL_CONTEXT_TOKEN_BUDGET` to leave more headroom for provider limits.
-
-
-
